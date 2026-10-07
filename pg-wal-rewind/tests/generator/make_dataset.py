@@ -5,15 +5,16 @@ Usage (as root, PostgreSQL 16 installed, server runs as user `claude`):
 
 Builds a cluster with 1 MB WAL segments and WAL archiving, loads an order schema (two plain
 tables and a partitioned one, an enum, a domain, intervals and floats), takes a base backup while the workload keeps
-running, then runs a seeded multi-session workload (DDL, partition attach/detach/create, table
-rewrites, enum renames, upserts, COPY, locks that become multixacts, savepoints, two-phase
-commits, checkpoints, VACUUM, a changing wal_compression), two point-in-time restores (timeline 2 from timeline 1, then
-timeline 3 from timeline 1 again), bad bulk jobs and the VACUUM that erases the old row
-versions. While the workload runs it records the live SELECT * of the three tables at quiet
+running (used only for the restores), then starts the archive the tool gets at a checkpoint taken while the server is
+idle and runs a seeded multi-session workload (DDL, partition attach/detach/create, enum renames, upserts, COPY,
+locks that become multixacts, savepoints, two-phase commits, checkpoints, VACUUM, a changing wal_compression), two
+point-in-time restores (timeline 2 from timeline 1, then timeline 3 from timeline 1 again; each promoted server takes a
+checkpoint before any work), bad bulk jobs and the VACUUM that erases the old row versions. At the end it takes a second
+base backup, the one the tool gets. While the workload runs it records the live SELECT * of the three tables at quiet
 instants.
 
-Writes OUT_DIR/backup (the subset of the base backup the tool works from),
-OUT_DIR/wal (archived segments from the backup start onward) and
+Writes OUT_DIR/backup (the subset of the final base backup the tool works from),
+OUT_DIR/wal (archived segments from the archive-start checkpoint onward) and
 OUT_DIR.truth.json (the captured answers).
 """
 import io
@@ -424,8 +425,6 @@ k.execute("VACUUM FULL pg_attribute")
 k.execute("VACUUM FULL pg_type")
 k.execute("VACUUM FULL pg_enum")
 k.execute("VACUUM (FREEZE) order_items")
-k.execute("SELECT pg_relation_filenode('orders')")
-ORDERS_NODE0 = k.fetchone()[0]
 ddl.autocommit = False
 
 truth = []
@@ -516,6 +515,13 @@ def finish_all(commit_p):
     for i in range(len(sessions)):
         if state[i]["open"]:
             finish(i, rng.random() < commit_p)
+
+
+def go_idle():
+    """Close every open and prepared transaction."""
+    finish_all(0.9)
+    while prepared:
+        resolve_prepared()
 
 
 known = live_orders()
@@ -668,7 +674,6 @@ DDL_OPS = [
     (has_column("orders", "stage"), ["ALTER TABLE orders ADD COLUMN stage order_stage NOT NULL DEFAULT 'queued'"]),
     ("SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_legacy'::regclass)",
      ["ALTER TABLE shipments ATTACH PARTITION shipments_legacy FOR VALUES FROM ('2020-01-01') TO ('2025-01-01')"]),
-    (f"SELECT pg_relation_filenode('orders') <> {ORDERS_NODE0}", ["VACUUM FULL orders"]),
     ("SELECT NOT " + has_column("orders", "gift")[7:], ["ALTER TABLE orders DROP COLUMN gift"]),
     ("SELECT EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'picked')",
      ["ALTER TYPE order_stage RENAME VALUE 'picking' TO 'picked'"]),
@@ -676,9 +681,6 @@ DDL_OPS = [
      ["ALTER TABLE shipments ATTACH PARTITION archive.shipments_2019 FOR VALUES FROM ('2019-01-01') TO ('2020-01-01')"]),
     ("SELECT to_regclass('shipments_2027') IS NOT NULL",
      ["CREATE TABLE shipments_2027 PARTITION OF shipments FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')"]),
-    ("SELECT format_type(atttypid, atttypmod) = 'numeric(12,3)' FROM pg_attribute "
-     "WHERE attrelid = 'order_items'::regclass AND attname = 'unit_price'",
-     ["ALTER TABLE order_items ALTER COLUMN unit_price TYPE numeric(12,3)"]),
     ("SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'shipments'::regclass AND attnum = 6 "
      "AND NOT attisdropped)", ["ALTER TABLE shipments DROP COLUMN label"]),
     ("SELECT NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_2025'::regclass)",
@@ -803,6 +805,7 @@ def restore(target, timeline):
         if not pk.fetchone()[0]:
             break
         time.sleep(0.1)
+    pk.execute("CHECKPOINT")  # before any work on the new timeline
     probe.close()
     reconnect()
     refresh_columns()
@@ -815,21 +818,6 @@ def restore(target, timeline):
     known_ship = live_shipments()
     time.sleep(0.01)
 
-
-# relations whose backed-up files the tool gets: the catalogs it needs, and every table and TOAST
-# table the three tables are made of when the backup starts
-k = snap.cursor()
-k.execute("""SELECT DISTINCT pg_relation_filenode(c.oid) FROM pg_class c
-             WHERE (c.relname IN ('pg_class', 'pg_attribute', 'pg_namespace', 'pg_type', 'pg_enum', 'pg_inherits')
-                    AND c.relnamespace = 'pg_catalog'::regnamespace)
-                OR c.oid IN (SELECT x.oid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
-                             AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%')
-                             AND x.relkind = 'r')
-                OR c.oid = 'archive.shipments_2019'::regclass
-                OR c.oid = (SELECT reltoastrelid FROM pg_class WHERE oid = 'archive.shipments_2019'::regclass)
-                OR c.oid IN (SELECT x.reltoastrelid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
-                             AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%'))""")
-ship = {str(r[0]) for r in k.fetchall() if r[0]}
 
 # history before the backup, some of it still open when the backup starts
 for step in range(150):
@@ -845,9 +833,17 @@ while bb.poll() is None:
     step_once(step)
     step += 1
 assert bb.returncode == 0
-finish_all(0.9)
+for step in range(step, step + 60):
+    step_once(step)
+# the archive the tool gets starts here: the server is idle, a new segment begins and a checkpoint is taken
+go_idle()
+k = snap.cursor()
+k.execute("SELECT pg_walfile_name(pg_switch_wal())")
+k.execute("SELECT pg_walfile_name(pg_current_wal_insert_lsn())")
+start_file = k.fetchone()[0]
+k.execute("CHECKPOINT")
 time.sleep(0.05)
-snapshot("after-backup")
+snapshot("archive-start")
 
 steps = P["steps"]
 # phase A on timeline 1
@@ -893,9 +889,31 @@ insert_shipments(two_pc, [rng.choice(live_orders())])
 two_pc.cursor().execute("PREPARE TRANSACTION 'payout-final'")
 two_pc.commit()
 time.sleep(0.05)
+# relations whose backed-up files the tool gets: the catalogs it needs, and every table and TOAST
+# table that is, or once was, part of the three tables on the final timeline
 k = snap.cursor()
+k.execute("""SELECT DISTINCT pg_relation_filenode(c.oid) FROM pg_class c
+             WHERE (c.relname IN ('pg_class', 'pg_attribute', 'pg_namespace', 'pg_type', 'pg_enum', 'pg_inherits')
+                    AND c.relnamespace = 'pg_catalog'::regnamespace)
+                OR c.oid IN (SELECT x.oid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
+                             AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%')
+                             AND x.relkind = 'r')
+                OR c.oid = 'archive.shipments_2019'::regclass
+                OR c.oid = (SELECT reltoastrelid FROM pg_class WHERE oid = 'archive.shipments_2019'::regclass)
+                OR c.oid IN (SELECT x.reltoastrelid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
+                             AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%'))""")
+ship = {str(r[0]) for r in k.fetchall() if r[0]}
+
 k.execute("SELECT oid FROM pg_database WHERE datname = 'shop'")
 shop_oid = str(k.fetchone()[0])
+# the base backup the tool gets, taken at the end with the last transactions still open or prepared
+FB = PGDATA + ".final"
+if os.path.exists(FB):
+    shutil.rmtree(FB)
+os.makedirs(FB)
+shutil.chown(FB, "claude")
+as_pg(os.path.join(PGBIN, "pg_basebackup"), "-h", SOCK, "-U", "postgres", "-D", FB, "-X", "none",
+      "-c", "fast", "--no-sync", "--no-manifest")
 last_seg = archive_everything()
 subprocess.run([CTL, "-D", PGDATA, "-m", "fast", "stop"], check=True, stdout=subprocess.DEVNULL, user="claude")
 
@@ -903,17 +921,14 @@ subprocess.run([CTL, "-D", PGDATA, "-m", "fast", "stop"], check=True, stdout=sub
 if os.path.exists(OUT):
     shutil.rmtree(OUT)
 os.makedirs(OUT)
-with open(os.path.join(BK, "backup_label")) as f:
-    label = f.read()
-start_file = label.split("(file ")[1].split(")")[0]
 dst_base = os.path.join(OUT, "backup", "base", shop_oid)
 os.makedirs(dst_base)
-for name in os.listdir(os.path.join(BK, "base", shop_oid)):
+for name in os.listdir(os.path.join(FB, "base", shop_oid)):
     if name in ship or name == "pg_filenode.map":  # main forks of the relations involved
-        shutil.copyfile(os.path.join(BK, "base", shop_oid, name), os.path.join(dst_base, name))
+        shutil.copyfile(os.path.join(FB, "base", shop_oid, name), os.path.join(dst_base, name))
 for d in ("pg_xact", "pg_multixact/offsets", "pg_multixact/members"):
-    shutil.copytree(os.path.join(BK, d), os.path.join(OUT, "backup", d))
-shutil.copyfile(os.path.join(BK, "backup_label"), os.path.join(OUT, "backup", "backup_label"))
+    shutil.copytree(os.path.join(FB, d), os.path.join(OUT, "backup", d))
+shutil.copyfile(os.path.join(FB, "backup_label"), os.path.join(OUT, "backup", "backup_label"))
 os.makedirs(os.path.join(OUT, "wal"))
 for name in sorted(os.listdir(ARCH)):
     if (len(name) == 24 and name[8:] >= start_file[8:]) or name.endswith(".history") or \

@@ -361,45 +361,135 @@ def new_tuple(xid, m2, m, hoff, body, blkno, offnum):
     return t
 
 
-class Replayer:
-    def __init__(self, data_dir, path):
+def reset_xmax(pg, offnum):
+    item = pg.items.get(offnum)
+    if item and item[0] == "n":
+        t = bytearray(item[1])
+        set_xmax(t, 0)
+        pg.items[offnum] = ("n", t)
+
+
+def undo(rmid, info, bid, blocks, main, pg):
+    """The page before the record that wrote image `pg`, as far as SELECT can tell: tuples the record added
+    are gone and tuples it deleted, updated or locked are still live. Pruning, freezing and the rest only
+    touched tuples no snapshot could see any more, or nothing a row's value depends on."""
+    op = info & 0x70
+    if rmid == RM_HEAP:
+        if op == 0x00:
+            pg.items.pop(u16(main, 0), None)
+        elif op in (0x10, 0x60):
+            reset_xmax(pg, u16(main, 4))
+        elif op in (0x20, 0x40):
+            old_off, new_off = u16(main, 4), u16(main, 12)
+            if bid == 0:
+                pg.items.pop(new_off, None)
+            if bid == 1 or 1 not in blocks:  # the old version is on this page
+                reset_xmax(pg, old_off)
+    elif rmid == RM_HEAP2:
+        if op == 0x50:
+            for i in range(u16(main, 2)):
+                pg.items.pop(u16(main, 4 + 2 * i), None)
+        elif op == 0x60:
+            reset_xmax(pg, u16(main, 4))
+    return pg
+
+
+class Base:
+    """What every timeline shares: the pages as they were at the checkpoint the archive starts with, rebuilt
+    from the base backup taken at the end, plus the backup's pg_xact and pg_multixact for the transactions
+    that were over by then.
+
+    The server was idle at that checkpoint, so all earlier transactions had ended, and full_page_writes means
+    the first change to any page after it (on the final timeline's path too, since each promoted server took
+    a checkpoint before any work) carries an image of the page. A page that path never changes is the backup's
+    copy; any other page is its first image with that one change undone."""
+
+    def __init__(self, data_dir, paths):
         bk = os.path.join(data_dir, "backup")
         with open(os.path.join(bk, "backup_label")) as f:
             label = dict(line.split(": ", 1) for line in f.read().splitlines() if ": " in line)
-        hi, lo = label["START WAL LOCATION"].split()[0].split("/")
-        self.start = (int(hi, 16) << 32) | int(lo, 16)
-        hi, lo = label["CHECKPOINT LOCATION"].split("/")
-        self.checkpoint_lsn = (int(hi, 16) << 32) | int(lo, 16)
+        final_tli = int(label["START TIMELINE"])
         dbs = os.listdir(os.path.join(bk, "base"))
         assert len(dbs) == 1
         self.db = int(dbs[0])
-        self.base = os.path.join(bk, "base", dbs[0])
+        base = os.path.join(bk, "base", dbs[0])
         self.pages = {}       # (relnode, blkno) -> Page
         self.rels = set()
-        for name in os.listdir(self.base):
+        for name in os.listdir(base):
             if name.isdigit():
                 rel = int(name)
                 self.rels.add(rel)
-                with open(os.path.join(self.base, name), "rb") as f:
+                with open(os.path.join(base, name), "rb") as f:
                     data = f.read()
                 for blk in range(len(data) // BLCKSZ):
                     raw = data[blk * BLCKSZ:(blk + 1) * BLCKSZ]
                     if raw[14:16] != b"\0\0":
                         self.pages[(rel, blk)] = Page.parse(raw)
-        with open(os.path.join(self.base, "pg_filenode.map"), "rb") as f:
+        with open(os.path.join(base, "pg_filenode.map"), "rb") as f:
             m = f.read()
         assert u32(m, 0) == 0x592717
         self.relmap = {u32(m, 8 + 8 * i): u32(m, 12 + 8 * i) for i in range(u32(m, 4))}
         self.clog = SlruReader(os.path.join(bk, "pg_xact"))
         self.moffsets = SlruReader(os.path.join(bk, "pg_multixact", "offsets"))
         self.mmembers = SlruReader(os.path.join(bk, "pg_multixact", "members"))
+
+        # the checkpoint at the start of the archive
+        wal_dir = os.path.join(data_dir, "wal")
+        wal = Wal(wal_dir, paths[1])
+        first = min(seg for tli, seg in wal.files if tli == 1)
+        seg_start = first * wal.segsize
+        rem = u32(wal.segment(seg_start), 16)
+        pos = seg_start + 40 + maxalign(rem) if rem < BLCKSZ - 40 else None
+        assert pos is not None
+        for _, _, rec in wal.records(pos):
+            if rec[17] == RM_XLOG and (rec[16] & 0xF0) in (0x00, 0x10):
+                _, _, _, _, main = decode_record(rec)
+                self.start = struct.unpack_from("<Q", main, 0)[0]
+                self.next_xid = struct.unpack_from("<Q", main, 24)[0] & 0xFFFFFFFF
+                self.next_multi, self.next_moffset = struct.unpack_from("<II", main, 36)
+                break
+
+        # first change to each page on the final timeline's path
+        seen = set()
+        for _, end, rec in Wal(wal_dir, paths[final_tli]).records(self.start):
+            rmid, info = rec[17], rec[16]
+            if rmid not in (RM_HEAP, RM_HEAP2) and not (rmid == RM_XLOG and (info & 0xF0) == 0xB0):
+                continue
+            if rmid == RM_HEAP2 and (info & 0x70) == 0x40:  # VISIBLE leaves the heap page's tuples alone
+                continue
+            xid, info, rmid, blocks, main = decode_record(rec)
+            for bid, b in blocks.items():
+                if b.fork != 0 or b.rel[1] != self.db:
+                    continue
+                key = (b.rel[2], b.blkno)
+                if key in seen:
+                    continue
+                seen.add(key)
+                init = rmid != RM_XLOG and info & 0x80 and bid == 0
+                if init:
+                    self.pages.pop(key, None)
+                elif b.apply:
+                    pg = Page.parse(b.image)
+                    self.pages[key] = undo(rmid, info, bid, blocks, main, pg) if rmid != RM_XLOG else pg
+                    self.rels.add(key[0])
+        for pg in self.pages.values():
+            pg.lsn = 0
+
+
+class Replayer:
+    def __init__(self, base, data_dir, path):
+        self.db = base.db
+        self.pages = {k: Page(0, {o: (it[0], bytearray(it[1])) if it[0] == "n" else it for o, it in p.items.items()})
+                      for k, p in base.pages.items()}
+        self.rels = set(base.rels)
+        self.relmap = base.relmap
+        self.clog, self.moffsets, self.mmembers = base.clog, base.moffsets, base.mmembers
         self.commits = {}     # xid -> commit time (us since 2000)
         self.multis = {}      # multixact -> [(xid, status)]
-        self.next_xid = None  # from the backup's checkpoint
-        self.next_multi = None
-        self.next_moffset = None
+        # transactions and multixacts from before the archive's checkpoint are looked up in the backup
+        self.next_xid, self.next_multi, self.next_moffset = base.next_xid, base.next_multi, base.next_moffset
         self.wal = Wal(os.path.join(data_dir, "wal"), path)
-        self.stream = self.wal.records(self.start)
+        self.stream = self.wal.records(base.start)
         self.pending = None
 
     # --- transaction status
@@ -415,7 +505,7 @@ class Replayer:
     def members(self, multi):
         if multi in self.multis:
             return self.multis[multi]
-        # created before the backup: read pg_multixact
+        # created before the archive's checkpoint: read pg_multixact
         start = self.moffsets.u32(multi // 2048, (multi % 2048) * 4)
         nxt = (multi + 1) & 0xFFFFFFFF or 1
         end = self.next_moffset if nxt == self.next_multi else self.moffsets.u32(nxt // 2048, (nxt % 2048) * 4)
@@ -451,8 +541,9 @@ class Replayer:
     def page_for(self, b, lsn, adopt=False):
         """Fetch a block for redo. Returns the Page if the record still has to be applied.
 
-        Relations created after the backup (rewrites, new partitions) are not in the backup; they are
-        followed from the first heap record or page image that writes them (`adopt`)."""
+        Relations created after the archive's checkpoint and gone by the end (a partition made on an abandoned
+        timeline) are not in the backup; they are followed from the first heap record or page image that
+        writes them (`adopt`)."""
         if b.fork != 0 or b.rel[1] != self.db:
             return None
         if b.rel[2] not in self.rels:
@@ -495,10 +586,6 @@ class Replayer:
             return
         if rmid == RM_XLOG:
             op = info & 0xF0
-            if op in (0x00, 0x10) and self.next_xid is None:
-                full = struct.unpack_from("<Q", main, 24)[0]
-                self.next_xid = full & 0xFFFFFFFF
-                self.next_multi, self.next_moffset = struct.unpack_from("<II", main, 36)
             for b in blocks.values():  # XLOG_FPI from log_newpage() writes rewritten heaps too
                 self.page_for(b, lsn, adopt=(info & 0xF0) == 0xB0)
             return
@@ -1223,6 +1310,7 @@ def answer(data_dir, queries):
     live_from = {}
     for tli, path in paths.items():
         live_from[tli] = -(1 << 63) if len(path) == 1 else first_commit(data_dir, path)
+    base = Base(data_dir, paths)
     groups = {}
     for i, (_, at) in enumerate(queries):
         when = parse_at(at)
@@ -1230,7 +1318,7 @@ def answer(data_dir, queries):
         groups.setdefault(tli, []).append(i)
     out = [None] * len(queries)
     for tli, idx in groups.items():
-        rp = Replayer(data_dir, paths[tli])
+        rp = Replayer(base, data_dir, paths[tli])
         for i in sorted(idx, key=lambda i: parse_at(queries[i][1])):
             rp.run_until(parse_at(queries[i][1]))
             out[i] = Snapshot(rp).select(queries[i][0])

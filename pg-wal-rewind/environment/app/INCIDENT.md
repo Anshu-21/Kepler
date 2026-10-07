@@ -7,20 +7,21 @@ The shop database runs on PostgreSQL 16.15. Its setup:
 * x86-64, 8 kB pages, no data checksums, database encoding UTF8.
 * `wal_level = replica`, `full_page_writes = on`, `track_commit_timestamp = off`.
 * The cluster was created with 1 MB WAL segments.
-* A base backup is taken with `pg_basebackup`, and every WAL segment since then is archived.
 * `wal_compression` has been changed several times, between `pglz`, `lz4` and `off`.
+* The WAL archive we kept starts with a segment in which a checkpoint was taken while the primary was idle: no transaction was open or prepared at that moment. Every segment written since then, on any timeline, is in the archive.
+* The only base backup we have was taken with `pg_basebackup` at the very end of the history below, on the last timeline, while one transaction was still open and another was prepared. The older backup that the restores used is lost.
 
-Three tables matter: `public.orders`, `public.order_items` and `public.shipments`. `shipments` is partitioned by range on `shipped_on`, and one of its partitions is itself partitioned by list on `carrier`. Since the backup, their history has been messy:
+Three tables matter: `public.orders`, `public.order_items` and `public.shipments`. `shipments` is partitioned by range on `shipped_on`, and one of its partitions is itself partitioned by list on `carrier`. Since the archive starts, their history has been messy:
 
 * Columns were added and dropped, some with defaults. One column has an enum type whose values were later renamed and extended. Another has a domain type, and there are `interval` and `float8` columns.
 * Rows were upserted, copied in with `COPY`, locked, updated, moved between partitions, and deleted.
 * Partitions were created, attached and detached. Tables that had been built separately were attached as partitions; one of them has its own column order.
-* `orders` and `order_items` were each rewritten once, by `VACUUM FULL` and by `ALTER TABLE ... ALTER COLUMN ... TYPE`.
 * Some transactions used savepoints or two-phase commit.
 * Bad jobs rewrote and deleted rows, and `VACUUM` then removed the old row versions from the heap.
-* Bad jobs were twice undone with a point-in-time restore from this same backup.
+* Bad jobs were twice undone with a point-in-time restore from the older backup.
   * The first restore went back to a point on timeline 1 and became timeline 2.
   * Later, timeline 2 was abandoned too. The second restore went back to a later point on timeline 1 and became timeline 3.
+  * Each restored server took a checkpoint as soon as it was promoted, before doing any work.
   * The WAL of every abandoned branch is still in the archive.
 
 Auditors now ask what `SELECT *` returned on the primary at many past instants. Restoring a server for each instant is too slow, and the audit box has no PostgreSQL. We need a tool that answers straight from the backup and the archive.
@@ -29,12 +30,12 @@ Auditors now ask what `SELECT *` returned on the primary at many past instants. 
 
 | path | content |
 | --- | --- |
-| `backup/backup_label` | the label `pg_basebackup` wrote |
-| `backup/base/<db>/` | from the backup, `pg_filenode.map` and the main fork of these relations: `pg_class`, `pg_attribute`, `pg_namespace`, `pg_type`, `pg_enum` and `pg_inherits`, and every table and TOAST table that existed when the backup started and is, or later became, part of the three tables. Nothing else from the database was kept. |
-| `backup/pg_xact/`, `backup/pg_multixact/` | those directories as they were in the backup |
-| `wal/` | the archive from the backup's start segment onward: the segments of every timeline and the timeline history files |
+| `backup/backup_label` | the label `pg_basebackup` wrote for the final backup |
+| `backup/base/<db>/` | from that backup, `pg_filenode.map` and the main fork of these relations: `pg_class`, `pg_attribute`, `pg_namespace`, `pg_type`, `pg_enum` and `pg_inherits`, and every table and TOAST table that is, or at some point on the last timeline was, part of the three tables. Nothing else from the database was kept. |
+| `backup/pg_xact/`, `backup/pg_multixact/` | those directories as they were in that backup |
+| `wal/` | the archive, from the segment of the idle checkpoint onward: the segments of every timeline and the timeline history files |
 
-Relations created after the backup exist only in the WAL.
+A relation that only ever existed on an abandoned timeline exists only in the WAL.
 
 ## What the tool returns
 
@@ -55,7 +56,7 @@ python3 rewind.py DATA_DIR < queries.json
 * `columns` are the table's columns as defined at that instant, in `attnum` order.
 * `rows` holds every row that query returned. For `shipments`, that means the rows of every partition attached at that instant. Row order does not matter; duplicates do.
 * The primary at an instant is whichever server was live then. Timeline 1 was live until the first commit on timeline 2. Timeline 2 was then live until the first commit on timeline 3, and timeline 3 from then on.
-* Every instant asked about is after the base backup completed. No transaction commits exactly at an asked instant.
+* Every instant asked about is after the archive's first checkpoint and before the final backup started. No transaction commits exactly at an asked instant.
 
 Each value is the column's text output in a session with `TimeZone = 'UTC'`, `DateStyle = 'ISO'`, `IntervalStyle = 'postgres'` and `extra_float_digits = 1`, i.e. `value::text`. SQL NULL is `null`.
 
