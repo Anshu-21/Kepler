@@ -39,10 +39,6 @@ HEAP_KEYS_UPDATED = 0x2000
 HEAP_HOT_UPDATED = 0x4000
 NATTS_MASK = 0x07FF
 
-TYPES = {16: "bool", 20: "int8", 21: "int2", 23: "int4", 25: "text", 26: "oid", 1043: "varchar", 1042: "bpchar",
-         1700: "numeric", 1184: "timestamptz", 1114: "timestamp", 1082: "date", 2950: "uuid", 19: "name"}
-
-
 def u16(b, o):
     return b[o] | (b[o + 1] << 8)
 
@@ -126,6 +122,348 @@ def lz4_decompress(src, rawsize):
             for k in range(mlen):
                 out.append(out[start + k])
     return bytes(out[:rawsize])
+
+
+# zstd (RFC 8878), for page images written with wal_compression = zstd
+
+LL_BASE = list(range(16)) + [16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+                             16384, 32768, 65536]
+LL_BITS = [0] * 16 + [1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+ML_BASE = [i + 3 for i in range(32)] + [35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051,
+                                        4099, 8195, 16387, 32771, 65539]
+ML_BITS = [0] * 32 + [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+LL_DEFAULT = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+              -1, -1, -1, -1]
+ML_DEFAULT = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+              1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
+OF_DEFAULT = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
+
+
+class _Back:
+    """Backward bit reader: reads from the end of `buf` towards its start."""
+    __slots__ = ("buf", "off")
+
+    def __init__(self, buf):
+        self.buf = buf
+        last = buf[-1]
+        if not last:
+            raise ValueError("zstd: bitstream without end mark")
+        self.off = (len(buf) - 1) * 8 + last.bit_length() - 1
+
+    def read(self, n):
+        if n == 0:
+            return 0
+        self.off -= n
+        o = self.off
+        if o < 0:
+            if o + n <= 0:
+                return 0
+            v = int.from_bytes(self.buf[0:8], "little") & ((1 << (n + o)) - 1)
+            return v << -o
+        b = o >> 3
+        return (int.from_bytes(self.buf[b:b + 8], "little") >> (o & 7)) & ((1 << n) - 1)
+
+
+def _fse_table(norm, al):
+    size = 1 << al
+    sym = [0] * size
+    high = size
+    state = list(norm)
+    for s, p in enumerate(norm):
+        if p == -1:
+            high -= 1
+            sym[high] = s
+            state[s] = 1
+    step = (size >> 1) + (size >> 3) + 3
+    mask = size - 1
+    pos = 0
+    for s, p in enumerate(norm):
+        if p <= 0:
+            continue
+        for _ in range(p):
+            sym[pos] = s
+            pos = (pos + step) & mask
+            while pos >= high:
+                pos = (pos + step) & mask
+    nb = [0] * size
+    base = [0] * size
+    for i in range(size):
+        s = sym[i]
+        d = state[s]
+        state[s] += 1
+        nb[i] = al - (d.bit_length() - 1)
+        base[i] = (d << nb[i]) - size
+    return sym, nb, base, al
+
+
+def _fse_header(src, pos, max_al):
+    """Read an FSE table description at src[pos:]. Returns (table, new_pos)."""
+    bitpos = 0
+
+    def read(n):
+        nonlocal bitpos
+        b = pos + (bitpos >> 3)
+        v = (int.from_bytes(src[b:b + 4], "little") >> (bitpos & 7)) & ((1 << n) - 1)
+        bitpos += n
+        return v
+
+    al = read(4) + 5
+    if al > max_al:
+        raise ValueError("zstd: accuracy log too large")
+    remaining = 1 << al
+    norm = []
+    while remaining > 0:
+        bits = (remaining + 1).bit_length()
+        val = read(bits)
+        lower = (1 << (bits - 1)) - 1
+        threshold = (1 << bits) - 1 - (remaining + 1)
+        if (val & lower) < threshold:
+            bitpos -= 1
+            val &= lower
+        elif val > lower:
+            val -= threshold
+        p = val - 1
+        remaining -= -p if p < 0 else p
+        norm.append(p)
+        if p == 0:
+            while True:
+                rep = read(2)
+                norm.extend([0] * rep)
+                if rep != 3:
+                    break
+    if remaining != 0:
+        raise ValueError("zstd: bad FSE table")
+    return _fse_table(norm, al), pos + ((bitpos + 7) >> 3)
+
+
+def _huf_weights(src, pos):
+    hb = src[pos]
+    pos += 1
+    if hb >= 128:
+        n = hb - 127
+        w = []
+        for i in range(n):
+            byte = src[pos + i // 2]
+            w.append(byte >> 4 if i % 2 == 0 else byte & 15)
+        return w, pos + (n + 1) // 2
+    end = pos + hb
+    table, p = _fse_header(src, pos, 6)
+    sym, nb, base, al = table
+    br = _Back(src[p:end])
+    s1 = br.read(al)
+    s2 = br.read(al)
+    w = []
+    while True:
+        w.append(sym[s1])
+        s1 = base[s1] + br.read(nb[s1])
+        if br.off < 0:
+            w.append(sym[s2])
+            break
+        w.append(sym[s2])
+        s2 = base[s2] + br.read(nb[s2])
+        if br.off < 0:
+            w.append(sym[s1])
+            break
+        if len(w) > 255:
+            raise ValueError("zstd: too many weights")
+    return w, end
+
+
+def _huf_table(weights):
+    total = sum(1 << (w - 1) for w in weights if w)
+    maxbits = total.bit_length()
+    left = (1 << maxbits) - total
+    if left & (left - 1):
+        raise ValueError("zstd: bad Huffman weights")
+    weights = weights + [left.bit_length()]
+    size = 1 << maxbits
+    sym = [0] * size
+    nbits = [0] * size
+    pos = 0
+    for w in range(1, maxbits + 1):
+        n = 1 << (w - 1)
+        for s, ws in enumerate(weights):
+            if ws == w:
+                sym[pos:pos + n] = [s] * n
+                nbits[pos:pos + n] = [maxbits + 1 - w] * n
+                pos += n
+    return sym, nbits, maxbits
+
+
+def _huf_stream(buf, n, table):
+    sym, nbits, maxbits = table
+    br = _Back(buf)
+    out = bytearray(n)
+    for i in range(n):
+        o = br.off - maxbits
+        if o >= 0:
+            b = o >> 3
+            v = (int.from_bytes(buf[b:b + 8], "little") >> (o & 7)) & ((1 << maxbits) - 1)
+        else:
+            v = (int.from_bytes(buf[0:8], "little") & ((1 << (maxbits + o)) - 1)) << -o if maxbits + o > 0 else 0
+        out[i] = sym[v]
+        br.off -= nbits[v]
+    return out
+
+
+class _Frame:
+    def __init__(self):
+        self.huf = None
+        self.tables = [None, None, None]
+        self.reps = [1, 4, 8]
+
+    def literals(self, src, pos):
+        b0 = src[pos]
+        ltype, sf = b0 & 3, (b0 >> 2) & 3
+        if ltype < 2:
+            if sf in (0, 2):
+                size, pos = b0 >> 3, pos + 1
+            elif sf == 1:
+                size, pos = (b0 >> 4) + (src[pos + 1] << 4), pos + 2
+            else:
+                size, pos = (b0 >> 4) + (src[pos + 1] << 4) + (src[pos + 2] << 12), pos + 3
+            if ltype == 0:
+                return bytes(src[pos:pos + size]), pos + size
+            return bytes([src[pos]]) * size, pos + 1
+        if sf < 2:
+            h = int.from_bytes(src[pos:pos + 3], "little")
+            regen, comp, hl = (h >> 4) & 0x3FF, (h >> 14) & 0x3FF, 3
+        elif sf == 2:
+            h = int.from_bytes(src[pos:pos + 4], "little")
+            regen, comp, hl = (h >> 4) & 0x3FFF, (h >> 18) & 0x3FFF, 4
+        else:
+            h = int.from_bytes(src[pos:pos + 5], "little")
+            regen, comp, hl = (h >> 4) & 0x3FFFF, (h >> 22) & 0x3FFFF, 5
+        pos += hl
+        end = pos + comp
+        if ltype == 2:
+            w, pos = _huf_weights(src, pos)
+            self.huf = _huf_table(w)
+        if self.huf is None:
+            raise ValueError("zstd: treeless literals without a table")
+        if sf == 0:
+            return bytes(_huf_stream(src[pos:end], regen, self.huf)), end
+        s1, s2, s3 = (int.from_bytes(src[pos + 2 * i:pos + 2 * i + 2], "little") for i in range(3))
+        pos += 6
+        q = (regen + 3) // 4
+        out = bytearray()
+        for i, ln in enumerate((s1, s2, s3, end - pos - s1 - s2 - s3)):
+            out += _huf_stream(src[pos:pos + ln], q if i < 3 else regen - 3 * q, self.huf)
+            pos += ln
+        return bytes(out), end
+
+    def block(self, src, pos, end, out):
+        lits, pos = self.literals(src, pos)
+        b0 = src[pos]
+        if b0 == 0:
+            out += lits
+            return
+        if b0 < 128:
+            nseq, pos = b0, pos + 1
+        elif b0 < 255:
+            nseq, pos = ((b0 - 128) << 8) + src[pos + 1], pos + 2
+        else:
+            nseq, pos = src[pos + 1] + (src[pos + 2] << 8) + 0x7F00, pos + 3
+        modes = src[pos]
+        pos += 1
+        for k, (shift, default, dal, maxal) in enumerate(((6, LL_DEFAULT, 6, 9), (4, OF_DEFAULT, 5, 8),
+                                                           (2, ML_DEFAULT, 6, 9))):
+            mode = (modes >> shift) & 3
+            if mode == 0:
+                self.tables[k] = _fse_table(default, dal)
+            elif mode == 1:
+                self.tables[k] = ([src[pos]], [0], [0], 0)
+                pos += 1
+            elif mode == 2:
+                self.tables[k], pos = _fse_header(src, pos, maxal)
+            elif self.tables[k] is None:
+                raise ValueError("zstd: repeat mode without a table")
+        (lsym, lnb, lbase, lal), (osym, onb, obase, oal), (msym, mnb, mbase, mal) = self.tables
+        br = _Back(src[pos:end])
+        ls, os_, ms = br.read(lal), br.read(oal), br.read(mal)
+        reps = self.reps
+        lp = 0
+        for i in range(nseq):
+            oc, mc, lc = osym[os_], msym[ms], lsym[ls]
+            ov = (1 << oc) + br.read(oc)
+            ml = ML_BASE[mc] + br.read(ML_BITS[mc])
+            ll = LL_BASE[lc] + br.read(LL_BITS[lc])
+            if ov > 3:
+                off = ov - 3
+                reps[:] = [off, reps[0], reps[1]]
+            else:
+                if ll == 0:
+                    ov += 1
+                if ov == 1:
+                    off = reps[0]
+                elif ov == 2:
+                    off = reps[1]
+                    reps[:] = [off, reps[0], reps[2]]
+                elif ov == 3:
+                    off = reps[2]
+                    reps[:] = [off, reps[0], reps[1]]
+                else:
+                    off = reps[0] - 1
+                    reps[:] = [off, reps[0], reps[1]]
+            if i + 1 < nseq:
+                ls = lbase[ls] + br.read(lnb[ls])
+                ms = mbase[ms] + br.read(mnb[ms])
+                os_ = obase[os_] + br.read(onb[os_])
+            out += lits[lp:lp + ll]
+            lp += ll
+            start = len(out) - off
+            if start < 0:
+                raise ValueError("zstd: offset before start")
+            if off >= ml:
+                out += out[start:start + ml]
+            else:
+                while ml > 0:
+                    chunk = out[start:start + min(off, ml)]
+                    out += chunk
+                    ml -= len(chunk)
+                    start += len(chunk)
+        out += lits[lp:]
+
+
+def zstd_decompress(src):
+    out = bytearray()
+    pos = 0
+    while pos < len(src):
+        magic = int.from_bytes(src[pos:pos + 4], "little")
+        pos += 4
+        if 0x184D2A50 <= magic <= 0x184D2A5F:  # skippable frame
+            pos += 4 + int.from_bytes(src[pos:pos + 4], "little")
+            continue
+        if magic != 0xFD2FB528:
+            raise ValueError("zstd: bad magic")
+        fhd = src[pos]
+        pos += 1
+        fcs_flag, single, checksum, did = fhd >> 6, (fhd >> 5) & 1, (fhd >> 2) & 1, fhd & 3
+        if not single:
+            pos += 1
+        pos += (0, 1, 2, 4)[did]
+        pos += (single, 2, 4, 8)[fcs_flag]
+        frame = _Frame()
+        while True:
+            h = int.from_bytes(src[pos:pos + 3], "little")
+            pos += 3
+            last, btype, bsize = h & 1, (h >> 1) & 3, h >> 3
+            if btype == 0:
+                out += src[pos:pos + bsize]
+                pos += bsize
+            elif btype == 1:
+                out += bytes([src[pos]]) * bsize
+                pos += 1
+            elif btype == 2:
+                frame.block(src, pos, pos + bsize, out)
+                pos += bsize
+            else:
+                raise ValueError("zstd: reserved block type")
+            if last:
+                break
+        if checksum:
+            pos += 4
+    return bytes(out)
 
 
 # ---------------------------------------------------------------- WAL reading
@@ -235,7 +573,8 @@ def decode_record(rec):
     order = []
     main_len = 0
     rel = None
-    while p < tot:
+    datatotal = 0
+    while tot - p > datatotal:  # block headers end where the declared data begins
         bid = rec[p]
         if bid == 255:
             main_len = rec[p + 1]
@@ -268,6 +607,7 @@ def decode_record(rec):
             else:
                 hole_len = 0
             img = (ilen, hole_off, hole_len, binfo)
+            datatotal += ilen
         if not fork_flags & 0x80:
             rel = struct.unpack_from("<III", rec, p)
             p += 12
@@ -276,6 +616,7 @@ def decode_record(rec):
         p += 4
         b.image = img
         b.data = dlen if fork_flags & 0x20 else 0
+        datatotal += b.data
         b.apply = bool(img and img[3] & 0x02)
         blocks[bid] = b
         order.append(bid)
@@ -290,7 +631,7 @@ def decode_record(rec):
             elif binfo & 0x08:
                 raw = lz4_decompress(raw, BLCKSZ - hole_len)
             elif binfo & 0x10:
-                raise ValueError("zstd page images are not supported")
+                raw = zstd_decompress(raw)
             b.image = raw[:hole_off] + bytes(hole_len) + raw[hole_off:]
         n = b.data
         b.data = rec[p:p + n]
@@ -449,10 +790,17 @@ class Replayer:
             self.pending = None
             self.apply(end, xid, info, rmid, blocks, main)
 
-    def page_for(self, b, lsn):
-        """Fetch a block for redo. Returns the Page if the record still has to be applied."""
-        if b.fork != 0 or b.rel[1] != self.db or b.rel[2] not in self.rels:
+    def page_for(self, b, lsn, adopt=False):
+        """Fetch a block for redo. Returns the Page if the record still has to be applied.
+
+        Relations created after the backup (rewrites, new partitions) are not in the backup; they are
+        followed from the first heap record or page image that writes them (`adopt`)."""
+        if b.fork != 0 or b.rel[1] != self.db:
             return None
+        if b.rel[2] not in self.rels:
+            if not (adopt and b.apply):
+                return None
+            self.rels.add(b.rel[2])
         key = (b.rel[2], b.blkno)
         if b.apply:
             pg = Page.parse(b.image)
@@ -467,8 +815,11 @@ class Replayer:
         return pg
 
     def init_page(self, b, lsn):
-        if b.fork != 0 or b.rel[1] != self.db or b.rel[2] not in self.rels:
+        if b.fork != 0 or b.rel[1] != self.db:
             return None
+        self.rels.add(b.rel[2])
+        if b.apply:  # a page image of the initialised page
+            return self.page_for(b, lsn)
         pg = Page(lsn)
         self.pages[(b.rel[2], b.blkno)] = pg
         return pg
@@ -490,9 +841,13 @@ class Replayer:
                 full = struct.unpack_from("<Q", main, 24)[0]
                 self.next_xid = full & 0xFFFFFFFF
                 self.next_multi, self.next_moffset = struct.unpack_from("<II", main, 36)
-            for b in blocks.values():
-                self.page_for(b, lsn)
+            for b in blocks.values():  # XLOG_FPI from log_newpage() writes rewritten heaps too
+                self.page_for(b, lsn, adopt=(info & 0xF0) == 0xB0)
             return
+        if rmid in (RM_HEAP, RM_HEAP2):
+            for b in blocks.values():
+                if b.apply and b.fork == 0 and b.rel[1] == self.db:
+                    self.rels.add(b.rel[2])
         if rmid == RM_HEAP:
             self.heap(lsn, xid, info, blocks, main)
         elif rmid == RM_HEAP2:
@@ -870,52 +1225,289 @@ def timestamp_text(us):
     return s + "+00"
 
 
-def render(typ, raw):
-    if typ == "int2":
+def tdiv(a, b):
+    """C integer division (truncates toward zero)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def interval_text(raw):
+    """interval_out with IntervalStyle = postgres."""
+    time, day, month = struct.unpack_from("<qii", raw, 0)
+    year, mon = tdiv(month, 12), month - 12 * tdiv(month, 12)
+    hour = tdiv(time, 3600000000)
+    time -= hour * 3600000000
+    minute = tdiv(time, 60000000)
+    time -= minute * 60000000
+    sec = tdiv(time, 1000000)
+    fsec = time - sec * 1000000
+    out = ""
+    is_zero, is_before = True, False
+    for value, unit in ((year, "year"), (mon, "mon"), (day, "day")):
+        if value == 0:
+            continue
+        out += ("" if is_zero else " ") + ("+" if is_before and value > 0 else "") + f"{value} {unit}" + \
+            ("s" if value != 1 else "")
+        is_before, is_zero = value < 0, False
+    if is_zero or hour or minute or sec or fsec:
+        minus = hour < 0 or minute < 0 or sec < 0 or fsec < 0
+        out += ("" if is_zero else " ") + ("-" if minus else "+" if is_before else "") + \
+            "%02d:%02d:%02d" % (abs(hour), abs(minute), abs(sec))
+        if fsec:
+            out += ("." + "%06d" % abs(fsec)).rstrip("0")
+    return out
+
+
+def _pow5_factor(v):
+    n = 0
+    while v and v % 5 == 0:
+        v //= 5
+        n += 1
+    return n
+
+
+def _d2d(mant, exp2):
+    """PostgreSQL's d2d() (Ryu, built without STRICTLY_SHORTEST) with exact integer arithmetic."""
+    if exp2 == 0:
+        e2, m2 = 1 - 1023 - 52 - 2, mant
+    else:
+        e2, m2 = exp2 - 1023 - 52 - 2, (1 << 52) | mant
+    mv = 4 * m2
+    mm_shift = 1 if mant != 0 or exp2 <= 1 else 0
+    mp, mm = mv + 2, mv - 1 - mm_shift
+    vr_tz = False
+    if e2 >= 0:
+        q = ((e2 * 78913) >> 18) - (e2 > 3)
+        e10 = q
+        den = 10 ** q
+        vr, vp, vm = (mv << e2) // den, (mp << e2) // den, (mm << e2) // den
+        if q <= 21:
+            if mv % 5 == 0:
+                vr_tz = _pow5_factor(mv) >= q
+            else:
+                vp -= _pow5_factor(mv + 2) >= q
+    else:
+        q = ((-e2 * 732923) >> 20) - (-e2 > 1)
+        i = -e2 - q
+        e10 = q + e2
+        f = 5 ** i
+        vr, vp, vm = (mv * f) >> q, (mp * f) >> q, (mm * f) >> q
+        if q <= 1:
+            vr_tz = True
+            vp -= 1
+        elif q < 63:
+            vr_tz = mv & ((1 << (q - 1)) - 1) == 0
+    removed = 0
+    if vr_tz:
+        last = 0
+        while vp // 10 > vm // 10:
+            vr_tz &= last == 0
+            last = vr % 10
+            vr, vp, vm = vr // 10, vp // 10, vm // 10
+            removed += 1
+        if vr_tz and last == 5 and vr % 2 == 0:
+            last = 4
+        output = vr + (vr == vm or last >= 5)
+    else:
+        round_up = False
+        while vp // 10 > vm // 10:
+            round_up = vr % 10 >= 5
+            vr, vp, vm = vr // 10, vp // 10, vm // 10
+            removed += 1
+        output = vr + (vr == vm or round_up)
+    return output, e10 + removed
+
+
+def float8_text(raw):
+    """float8out with extra_float_digits > 0: double_to_shortest_decimal() of src/common/d2s.c."""
+    bits = struct.unpack("<Q", raw[:8])[0]
+    sign = "-" if bits >> 63 else ""
+    exp2, mant = (bits >> 52) & 0x7FF, bits & ((1 << 52) - 1)
+    if exp2 == 0x7FF:
+        return "NaN" if mant else sign + "Infinity"
+    if exp2 == 0 and mant == 0:
+        return sign + "0"
+    e2 = exp2 - 1023 - 52
+    if -52 <= e2 <= 0 and mant & ((1 << -e2) - 1) == 0:  # d2d_small_int
+        output, e10 = ((1 << 52) | mant) >> -e2, 0
+    else:
+        output, e10 = _d2d(mant, exp2)
+    digits = str(output)
+    exp = e10 + len(digits) - 1
+    if -4 <= exp < 15:
+        if e10 >= 0:
+            return sign + digits + "0" * e10
+        point = len(digits) + e10
+        if point > 0:
+            return sign + digits[:point] + "." + digits[point:]
+        return sign + "0." + "0" * -point + digits
+    if e10 == 0:
+        digits = digits.rstrip("0")
+    body = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+    return sign + body + "e" + ("-" if exp < 0 else "+") + "%02d" % abs(exp)
+
+
+def json_escape(s):
+    out = ['"']
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch in "\b\f\n\r\t":
+            out.append({"\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def jsonb_text(raw):
+    """JsonbToCString of a jsonb value (raw = the bytes after the varlena header)."""
+
+    def container(pos):
+        hdr = u32(raw, pos)
+        n = hdr & 0x0FFFFFFF
+        is_obj = bool(hdr & 0x20000000)
+        nent = 2 * n if is_obj else n
+        jes = struct.unpack_from(f"<{nent}I", raw, pos + 4)
+        base = pos + 4 + 4 * nent
+        vals = []
+        off = 0
+        for je in jes:
+            end = (je & 0x0FFFFFFF) if je & 0x80000000 else off + (je & 0x0FFFFFFF)
+            kind = je & 0x70000000
+            if kind == 0x00000000:
+                vals.append(json_escape(raw[base + off:base + end].decode("utf-8")))
+            elif kind == 0x10000000:
+                p = base + ((off + 3) & ~3)
+                vals.append(numeric_text(varlena_payload(raw[p:p + varlena_size(raw, p)], None)))
+            elif kind == 0x20000000:
+                vals.append("false")
+            elif kind == 0x30000000:
+                vals.append("true")
+            elif kind == 0x40000000:
+                vals.append("null")
+            else:
+                vals.append(container(base + ((off + 3) & ~3)))
+            off = end
+        if hdr & 0x10000000:  # raw scalar, stored as a one-element array
+            return vals[0]
+        if is_obj:
+            return "{" + ", ".join(f"{vals[i]}: {vals[n + i]}" for i in range(n)) + "}"
+        return "[" + ", ".join(vals) + "]"
+
+    return container(0)
+
+
+class Types:
+    """pg_type and pg_enum as of the snapshot."""
+
+    def __init__(self, types, labels):
+        self.types = types    # oid -> dict(len, align, kind, base, elem)
+        self.labels = labels  # enum value oid -> label
+
+    def text(self, oid, raw):
+        t = self.types.get(oid)
+        if t is not None and t["kind"] == "d":
+            return self.text(t["base"], raw)
+        if t is not None and t["kind"] == "e":
+            return self.labels[u32(raw, 0)]
+        if t is not None and t["len"] == -1 and t["elem"]:
+            return self.array_text(raw)
+        return render(oid, raw)
+
+    def array_values(self, raw):
+        """(dims, lbounds, [value text or None]) of an array (raw = bytes after the varlena header)."""
+        ndim, dataoffset, elemtype = struct.unpack_from("<iiI", raw, 0)
+        if ndim == 0:
+            return [], [], []
+        dims = struct.unpack_from(f"<{ndim}i", raw, 12)
+        lbs = struct.unpack_from(f"<{ndim}i", raw, 12 + 4 * ndim)
+        nitems = 1
+        for d in dims:
+            nitems *= d
+        p = 12 + 8 * ndim
+        bitmap = None
+        if dataoffset:
+            bitmap = raw[p:p + (nitems + 7) // 8]
+            p = dataoffset - 4
+        else:
+            p = maxalign(p + 4) - 4
+        et = self.types[elemtype]
+        out = []
+        for i in range(nitems):
+            if bitmap is not None and not (bitmap[i >> 3] >> (i & 7)) & 1:
+                out.append(None)
+                continue
+            if et["len"] > 0:
+                p = align_to(p + 4, et["align"]) - 4
+                out.append(self.text(elemtype, raw[p:p + et["len"]]))
+                p += et["len"]
+            else:
+                if raw[p] == 0:
+                    p = align_to(p + 4, et["align"]) - 4
+                n = varlena_size(raw, p)
+                out.append(self.text(elemtype, varlena_payload(raw[p:p + n], None)))
+                p += n
+        return list(dims), list(lbs), out
+
+    def array_text(self, raw):
+        dims, lbs, vals = self.array_values(raw)
+        if not dims:
+            return "{}"
+
+        def quote(v):
+            if v is None:
+                return "NULL"
+            if v == "" or v.lower() == "null" or any(c in '"\\{},' or c in " \t\n\r\v\f" for c in v):
+                return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            return v
+
+        items = iter(quote(v) for v in vals)
+
+        def nest(level):
+            if level == len(dims) - 1:
+                return "{" + ",".join(next(items) for _ in range(dims[level])) + "}"
+            return "{" + ",".join(nest(level + 1) for _ in range(dims[level])) + "}"
+
+        prefix = "".join(f"[{lb}:{lb + d - 1}]" for d, lb in zip(dims, lbs)) + "=" if any(lb != 1 for lb in lbs) else ""
+        return prefix + nest(0)
+
+
+def render(oid, raw):
+    if oid == 21:
         return str(struct.unpack("<h", raw[:2])[0])
-    if typ in ("int4",):
+    if oid == 23:
         return str(struct.unpack("<i", raw[:4])[0])
-    if typ == "oid":
+    if oid == 26:
         return str(struct.unpack("<I", raw[:4])[0])
-    if typ == "int8":
+    if oid == 20:
         return str(struct.unpack("<q", raw[:8])[0])
-    if typ == "bool":
+    if oid == 16:
         return "true" if raw[0] else "false"
-    if typ in ("text", "varchar", "bpchar", "name"):
-        return raw.decode("utf-8").rstrip("\0") if typ == "name" else raw.decode("utf-8")
-    if typ == "numeric":
+    if oid in (25, 1043, 1042):
+        return raw.decode("utf-8")
+    if oid == 19:
+        return raw.rstrip(b"\0").decode("utf-8")
+    if oid == 1700:
         return numeric_text(raw)
-    if typ == "timestamptz":
+    if oid == 1184:
         return timestamp_text(struct.unpack("<q", raw[:8])[0])
-    if typ == "date":
+    if oid == 1082:
         return (EPOCH + timedelta(days=struct.unpack("<i", raw[:4])[0])).strftime("%Y-%m-%d")
-    if typ == "uuid":
+    if oid == 2950:
         h = raw[:16].hex()
         return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
-    raise ValueError(typ)
-
-
-TYPINFO = {"bool": (1, "c"), "int2": (2, "s"), "int4": (4, "i"), "int8": (8, "d"), "oid": (4, "i"),
-           "timestamptz": (8, "d"), "date": (4, "i"), "uuid": (16, "c")}
-
-
-def array_first(raw):
-    """First element of a one-dimensional array value (attmissingval)."""
-    ndim, dataoffset, elemtype = struct.unpack_from("<iiI", raw, 0)
-    typ = TYPES[elemtype]
-    p = 12 + 8 * ndim
-    if dataoffset:
-        nitems = struct.unpack_from("<i", raw, 12)[0]
-        bitmap = raw[p:p + (nitems + 7) // 8]
-        if not bitmap[0] & 1:
-            return None
-        p = dataoffset - 4
-    else:
-        p = maxalign(p + 4) - 4  # data starts MAXALIGNed relative to the varlena header
-    if typ in TYPINFO:
-        return render(typ, raw[p:p + TYPINFO[typ][0]])
-    n = varlena_size(raw, p)
-    return render(typ, varlena_payload(raw[p:p + n], None))
+    if oid == 3802:
+        return jsonb_text(raw)
+    if oid == 1186:
+        return interval_text(raw)
+    if oid == 701:
+        return float8_text(raw)
+    raise ValueError(f"type {oid}")
 
 
 # catalog layouts (PostgreSQL 16), as (attlen, attalign) up to the columns we read
@@ -925,6 +1517,11 @@ PG_NAMESPACE = [(4, "i"), (64, "c")]
 PG_ATTRIBUTE = [(4, "i"), (64, "c"), (4, "i"), (2, "s"), (2, "s"), (4, "i"), (4, "i"), (2, "s"), (1, "c"), (1, "c"),
                 (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (2, "s"),
                 (2, "s"), (4, "i"), (-1, "d"), (-1, "i"), (-1, "i"), (-1, "d")]
+PG_TYPE = [(4, "i"), (64, "c"), (4, "i"), (4, "i"), (2, "s"), (1, "c"), (1, "c"), (1, "c"), (1, "c"), (1, "c"),
+           (1, "c"), (4, "i"), (4, "i"), (4, "i"), (4, "i"), (4, "i"), (4, "i"), (4, "i"), (4, "i"), (4, "i"),
+           (4, "i"), (4, "i"), (1, "c"), (1, "c"), (1, "c"), (4, "i")]
+PG_ENUM = [(4, "i"), (4, "i"), (4, "i"), (64, "c")]
+PG_INHERITS = [(4, "i"), (4, "i"), (4, "i"), (1, "c")]
 
 
 class Snapshot:
@@ -933,6 +1530,38 @@ class Snapshot:
     def __init__(self, rp):
         self.rp = rp
         self.toast_chunks = {}
+        rp_cls = rp.relmap[1259]
+        self.classes = {}
+        for v in self.rows(rp_cls, PG_CLASS):
+            oid = u32(v[0], 0)
+            node = u32(v[7], 0) or rp.relmap.get(oid)
+            self.classes[oid] = dict(name=v[1].rstrip(b"\0").decode(), nsp=u32(v[2], 0), filenode=node,
+                                     toast=u32(v[12], 0), kind=chr(v[16][0]))
+        types = {}
+        for v in self.rows(self.node(1247), PG_TYPE):
+            types[u32(v[0], 0)] = dict(len=struct.unpack("<h", v[4])[0], align=chr(v[22][0]), kind=chr(v[6][0]),
+                                       elem=u32(v[13], 0), base=u32(v[25], 0))
+        labels = {u32(v[0], 0): v[3].rstrip(b"\0").decode() for v in self.rows(self.node(3501), PG_ENUM)}
+        self.types = Types(types, labels)
+        self.children = {}
+        for v in self.rows(self.node(2611), PG_INHERITS):
+            self.children.setdefault(u32(v[1], 0), []).append(u32(v[0], 0))
+        self.atts = {}
+        for v in self.rows(rp.relmap[1249], PG_ATTRIBUTE):
+            num = struct.unpack("<h", v[4])[0]
+            if num <= 0:
+                continue
+            missing = None
+            if v[14][0] and len(v) > 25 and v[25] is not None:
+                missing = self.types.array_values(varlena_payload(v[25], None))[2][0]
+            self.atts.setdefault(u32(v[0], 0), []).append(
+                dict(num=num, name=v[1].rstrip(b"\0").decode(), typ=u32(v[2], 0), len=struct.unpack("<h", v[3])[0],
+                     align=chr(v[9][0]), dropped=bool(v[17][0]), missing=missing))
+        for a in self.atts.values():
+            a.sort(key=lambda x: x["num"])
+
+    def node(self, oid):
+        return self.classes[oid]["filenode"]
 
     def rows(self, relnode, layout):
         for t in self.rp.tuples(relnode):
@@ -940,32 +1569,10 @@ class Snapshot:
                 vals, _ = deform(t, layout)
                 yield vals
 
-    def table(self, name):
-        rp = self.rp
-        cls_node = rp.relmap[1259]
-        att_node = rp.relmap[1249]
-        classes = {}
-        for v in self.rows(cls_node, PG_CLASS):
-            oid = u32(v[0], 0)
-            classes[oid] = dict(name=v[1].rstrip(b"\0").decode(), nsp=u32(v[2], 0), filenode=u32(v[7], 0),
-                                toast=u32(v[12], 0), kind=chr(v[16][0]))
-        ns_node = classes[2615]["filenode"] or rp.relmap.get(2615)
-        public = [u32(v[0], 0) for v in self.rows(ns_node, PG_NAMESPACE) if v[1].rstrip(b"\0") == b"public"][0]
-        oid = [o for o, c in classes.items() if c["name"] == name and c["nsp"] == public and c["kind"] == "r"][0]
-        rel = classes[oid]
-        atts = []
-        for v in self.rows(att_node, PG_ATTRIBUTE):
-            if u32(v[0], 0) != oid or struct.unpack("<h", v[4])[0] <= 0:
-                continue
-            missing = None
-            if v[14][0] and len(v) > 25 and v[25] is not None:
-                missing = array_first(varlena_payload(v[25], None))
-            atts.append(dict(num=struct.unpack("<h", v[4])[0], name=v[1].rstrip(b"\0").decode(),
-                             typ=TYPES.get(u32(v[2], 0)), len=struct.unpack("<h", v[3])[0], align=chr(v[9][0]),
-                             dropped=bool(v[17][0]), missing=missing))
-        atts.sort(key=lambda a: a["num"])
-        toast_node = classes[rel["toast"]]["filenode"] if rel["toast"] else None
-        return rel["filenode"], toast_node, atts
+    def leaves(self, oid):
+        if self.classes[oid]["kind"] == "r":
+            return [oid]
+        return [leaf for child in self.children.get(oid, []) for leaf in self.leaves(child)]
 
     def toast(self, toast_node):
         if toast_node not in self.toast_chunks:
@@ -978,33 +1585,39 @@ class Snapshot:
         return self.toast_chunks[toast_node]
 
     def select(self, name):
-        heap_node, toast_node, atts = self.table(name)
-        chunks = self.toast(toast_node) if toast_node else {}
-
-        def fetch(_toastrel, valueid):
-            parts = chunks[valueid]
-            return b"".join(parts[i] for i in range(len(parts)))
-
-        layout = [(a["len"], a["align"]) for a in atts]
+        public = [u32(v[0], 0) for v in self.rows(self.node(2615), PG_NAMESPACE) if v[1].rstrip(b"\0") == b"public"][0]
+        oid = [o for o, c in self.classes.items() if c["name"] == name and c["nsp"] == public and c["kind"] in "rp"][0]
+        columns = [a for a in self.atts[oid] if not a["dropped"]]
         rows = []
-        for t in self.rp.tuples(heap_node):
-            if not self.rp.visible(t):
-                continue
-            vals, natts = deform(t, layout)
-            row = []
-            for i, a in enumerate(atts):
-                if a["dropped"]:
+        for leaf in self.leaves(oid):
+            rel = self.classes[leaf]
+            atts = self.atts[leaf]
+            by_name = {a["name"]: i for i, a in enumerate(atts) if not a["dropped"]}
+            pick = [by_name[c["name"]] for c in columns]
+            chunks = self.toast(self.node(rel["toast"])) if rel["toast"] else {}
+
+            def fetch(_toastrel, valueid, chunks=chunks):
+                parts = chunks[valueid]
+                return b"".join(parts[i] for i in range(len(parts)))
+
+            layout = [(a["len"], a["align"]) for a in atts]
+            for t in self.rp.tuples(rel["filenode"]):
+                if not self.rp.visible(t):
                     continue
-                if i >= natts:
-                    row.append(a["missing"])
-                elif vals[i] is None:
-                    row.append(None)
-                elif a["len"] == -1:
-                    row.append(render(a["typ"], varlena_payload(vals[i], fetch)))
-                else:
-                    row.append(render(a["typ"], vals[i]))
-            rows.append(row)
-        return {"columns": [a["name"] for a in atts if not a["dropped"]], "rows": rows}
+                vals, natts = deform(t, layout)
+                row = []
+                for i in pick:
+                    a = atts[i]
+                    if i >= natts:
+                        row.append(a["missing"])
+                    elif vals[i] is None:
+                        row.append(None)
+                    elif a["len"] == -1:
+                        row.append(self.types.text(a["typ"], varlena_payload(vals[i], fetch)))
+                    else:
+                        row.append(self.types.text(a["typ"], vals[i]))
+                rows.append(row)
+        return {"columns": [c["name"] for c in columns], "rows": rows}
 
 
 def parse_at(at):

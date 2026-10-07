@@ -8,57 +8,93 @@ author_name = "Anshu Kumar"
 author_email = "kumaranshu303393@gmail.com"
 difficulty_explanation = """Every dataset was produced by a real PostgreSQL 16.15 server running a synthetic, seeded order workload written for this task; no production data is involved.
 
-This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive: answering "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after an earlier point-in-time restore forked the cluster onto a second timeline. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow; here none is installed, and the agent has to build that reader from the PostgreSQL sources shipped in the environment.
+This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive. They must answer "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after two point-in-time restores forked the cluster onto new timelines. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow. Here none is installed, and the agent has to build that reader from the PostgreSQL sources shipped in the environment.
 
 One correct answer needs all of the following:
-- the WAL page and record format: long and short page headers, records that cross page and 1 MB segment boundaries, block references with forks, page images with holes, compressed with pglz or LZ4 depending on when they were written, and the redo rules for the heap (insert, multi-insert from COPY, update and HOT update with prefix and suffix taken from the old tuple, delete, lock, speculative-insert confirmation, prune, vacuum, freeze, in-place catalog updates);
+- the WAL page and record format:
+  - long and short page headers, and records that cross page and 1 MB segment boundaries;
+  - block references with forks, and records with no main data, such as the XLOG_FPI images a table rewrite writes;
+  - page images with holes, compressed with pglz, LZ4 or Zstandard depending on when they were written, which means writing a Zstandard decoder (Huffman literals, FSE tables, repeat offsets) from a format description;
+  - the redo rules for the heap: insert, multi-insert from COPY, update and HOT update with prefix and suffix taken from the old tuple, delete, lock, speculative-insert confirmation, prune, vacuum, freeze, in-place catalog updates;
+- relations that do not exist in the backup: a VACUUM FULL and an ALTER COLUMN TYPE move two tables to new files, and new partitions are created after the backup, so their pages exist only as page images and initialised pages in the WAL;
 - the transaction rules: commit and abort records with subtransactions, COMMIT PREPARED records whose committed xid is the prepared transaction's rather than the record's, multixacts whose members come from WAL records or from the backed-up pg_multixact, lock-only xmax, frozen tuples, and transaction ids that wrap past 2^32 in three of the five sealed datasets;
 - point-in-time recovery semantics as of an instant, since replaying to the end and filtering afterwards loses the versions VACUUM removed;
-- the two timelines: the history file, segments of both timelines for the same positions, and which timeline was live at the instant;
-- the catalog as of the instant: pg_class and pg_attribute are found through pg_filenode.map (both were rewritten), table and TOAST filenodes differ from their OIDs, columns are added and dropped in the window with fast defaults stored as arrays in attmissingval, and the namespace must be checked because another schema has a table of the same name;
-- the values themselves: alignment, null bitmaps, short and external varlenas, TOAST with pglz and LZ4, numeric with its display scale, timestamps and dates.
+- three timelines:
+  - the history files, and segments of several timelines for the same positions;
+  - timeline 3 branches from timeline 1, after the point where timeline 2 branched, so it needs timeline 1 WAL that timeline 2 does not;
+  - which timeline was live at the instant;
+- the catalog as of the instant:
+  - pg_class, pg_attribute and pg_type are found through pg_filenode.map (all were rewritten), and table and TOAST filenodes differ from their OIDs and change during the window;
+  - columns are added and dropped, with fast defaults stored as arrays in attmissingval, including an enum default;
+  - the namespace must be checked because another schema has tables of the same names;
+  - the partitioned table is the union of its leaf partitions according to pg_inherits at that instant, two levels deep. One partition has its own physical column order and a dropped column, so columns map by name. Partitions are attached, detached and created in the window, and a column added to the parent lives in each partition's attmissingval;
+  - enum values come from pg_enum as of the instant (a value is renamed and another added), and a domain resolves to its base type through pg_type;
+- the values themselves:
+  - alignment, null bitmaps, short and external varlenas, and TOAST with pglz and LZ4;
+  - numeric with its display scale, timestamps and dates;
+  - interval in the postgres style with its sign rules;
+  - jsonb containers (offsets and lengths of JEntries, aligned numerics, raw scalars) printed with PostgreSQL's spacing and escapes;
+  - arrays with null bitmaps, several dimensions, non-default lower bounds and quoting;
+  - float8 printed as PostgreSQL's Ryu build prints it. That build excludes the rounding boundaries, so for some values its output differs from Python's shortest repr.
 
-Each of these is documented somewhere in the sources, but nothing assembles them, and one mistake changes the answer. The staging dataset has live answers at only two early instants, before the restore, before most of the DDL and long before the bad job. Most of the history has to be gotten right by reasoning. A PostgreSQL internals expert would need a full working day or more."""
-solution_explanation = """Read the archive: list the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs. Decide which timeline answers an instant. A timeline is live from its first commit record after its branch point; timeline 1 is live before that. Then replay that timeline's path from the backup.
+Each of these is documented somewhere in the sources or the reference notes, but nothing assembles them, and one mistake changes the answer. The staging dataset has live answers at only two early instants, on timeline 1 before either restore, before the rewrites, the partition changes and the enum rename, and long before the bad jobs. Most of the history has to be gotten right by reasoning. A PostgreSQL internals expert would need several working days."""
+solution_explanation = """Read the archive. List the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs; a history file may skip a timeline. Decide which timeline answers an instant: a timeline is live from its first commit record after its branch point, and timeline 1 is live before any of those. Then replay that timeline's path from the backup.
 
-Load the backed-up pages of the shipped relations. Read records from the backup label's start LSN: skip page headers, join records that span pages, and follow XLOG_SWITCH to the next segment. Decode the block references, and restore page images after decompressing them and refilling the hole. Apply heap and heap2 redo on a per-page model of line pointers and tuple bytes, skipping blocks whose page LSN is already past the record. For each commit, or for a commit-prepared record (taking the prepared xid), store the commit time for the xid and its subtransactions. Keep the multixact members from CREATE_ID records. Stop just before the first commit later than the instant.
+Load the backed-up pages. Read records from the backup label's start LSN: skip page headers, join records that span pages, and follow XLOG_SWITCH to the next segment.
 
-Visibility at that point: a version counts if its xmin is frozen or committed, and its xmax is absent, lock-only, a multixact without a committed updater, or uncommitted. Transactions older than the backup's checkpoint use the backed-up pg_xact; older multixacts use pg_multixact. Read pg_class, pg_namespace and pg_attribute through pg_filenode.map with the same rule to get the table's filenode, its TOAST filenode and its columns as of the instant. Then decode each tuple. Walk dropped columns too, honour the null bitmap and the varlena alignment rule, use attmissingval for attributes past the tuple's natts, and detoast through the TOAST relation. Render values in the server's text format."""
+Decode the block references; the block headers end where the declared data lengths begin, which matters for records without main data. Restore page images after decompressing them and refilling the hole. Zstandard images need a frame decoder covering raw, RLE and compressed blocks, Huffman-coded literals with direct or FSE-coded weights, and FSE-coded sequences with repeat offsets.
+
+Apply heap and heap2 redo, and XLOG_FPI images, on a per-page model of line pointers and tuple bytes, for any relation of the database. A relation missing from the backup starts with its first initialised page or page image. Skip blocks whose page LSN is already past the record.
+
+For each commit, or for a commit-prepared record (taking the prepared xid), store the commit time for the xid and its subtransactions. Keep the multixact members from CREATE_ID records. Stop just before the first commit later than the instant.
+
+Visibility at that point: a version counts if its xmin is frozen or committed, and its xmax is absent, lock-only, a multixact without a committed updater, or uncommitted. Transactions older than the backup's checkpoint use the backed-up pg_xact; older multixacts use pg_multixact.
+
+Read pg_class (through pg_filenode.map for mapped catalogs), pg_namespace, pg_type, pg_enum, pg_inherits and pg_attribute with the same rule, as of the instant:
+- find the table in public;
+- expand a partitioned table to its leaf partitions through pg_inherits;
+- for each leaf, map the parent's columns to the leaf's attributes by name, and find its filenode and TOAST filenode.
+
+Then decode each tuple:
+- walk dropped columns too, and honour the null bitmap and the varlena alignment rule;
+- use attmissingval for attributes past the tuple's natts, and detoast through the TOAST relation;
+- render values in the server's text format: domains through their base type and enums through pg_enum;
+- arrays per element with array_out's quoting and bounds, jsonb by walking its containers, interval with EncodeInterval's postgres style, and float8 with a port of d2s.c's d2d() (no STRICTLY_SHORTEST)."""
 verification_explanation = """Each of the five sealed datasets was produced by tests/generator/make_dataset.py with PostgreSQL 16.15. The script works as follows:
 - It builds a cluster with 1 MB segments and WAL archiving. In most seeds (three of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
-- It loads the schema and rewrites orders, pg_class and pg_attribute with VACUUM FULL.
+- It loads the schema: orders, order_items and a two-level partitioned shipments table, plus a separately built legacy table with its own column order. The types include an enum, a domain, jsonb, text and int arrays, interval and float8. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
 - It takes a pg_basebackup while sessions keep writing.
-- It then runs a seeded workload of three to five interleaved sessions: inserts, upserts, COPY, HOT and non-HOT updates (toasted and not), deletes, FOR UPDATE and FOR KEY SHARE locks that become multixacts, savepoints rolled back and released, PREPARE TRANSACTION with later COMMIT or ROLLBACK PREPARED, checkpoints, changes of wal_compression, VACUUM and VACUUM FREEZE, and column additions and drops.
-- Partway through, it stops the server, restores the base backup to an earlier instant, and continues on timeline 2. Timeline 1's later WAL is left in the archive.
-- On timeline 2 it runs more of the same, a bad bulk update and delete, and the VACUUM that removes the old versions. It ends with one transaction left open and one prepared.
+- It then runs a seeded workload of three to five interleaved sessions:
+  - inserts, upserts and COPY;
+  - HOT and non-HOT updates (toasted and not), updates that move rows between partitions, and deletes;
+  - FOR UPDATE and FOR KEY SHARE locks that become multixacts;
+  - savepoints rolled back and released, and PREPARE TRANSACTION with later COMMIT or ROLLBACK PREPARED;
+  - checkpoints, VACUUM and VACUUM FREEZE, and wal_compression cycling through pglz, lz4, zstd and off.
+- Its schema changes are applied in a fixed order and redone after each restore: column additions and drops, a column of the enum type with a default, attaching the legacy table, VACUUM FULL orders, an enum value renamed, a partition created, ALTER COLUMN TYPE on order_items, a partition detached, an enum value added, and a column with a default added to the partitioned table.
+- On timeline 1 it captures two restore points and runs a bad bulk job. It then restores the base backup to the first restore point, which makes timeline 2, and runs more of the same with another bad job. Then it restores again, to the second restore point on timeline 1, which makes timeline 3, and runs the last phase. The abandoned WAL stays in the archive.
+- It ends with shared locks, a bad job, the VACUUM that removes the old versions, one transaction left open and one prepared.
 
-Throughout, the script captured the live result of SELECT * of both tables, with every value cast to text and TimeZone set to UTC, at about twenty instants chosen when no transaction was committing. These cover both timelines and every phase. Those results are the expected answers, stored per query as the column list, a row count and the sorted row hashes.
+Throughout, the script captured the live result of SELECT * of the three tables, with every value cast to text and TimeZone set to UTC, at about twenty-five instants chosen when no transaction was committing. These cover all three timelines and every phase. Those results are the expected answers, stored per query as the column list, a row count and the sorted row hashes.
 
-The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR` in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
+The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR`, in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
 
-Measured in Docker with 2 CPUs: the reference scores 1 and answers a dataset's 40 queries in about 6 seconds; the skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
-- always answering from the newest timeline, or always from the oldest;
-- switching timelines at the restore target in the history file instead of at the new timeline's first commit;
-- ignoring page images, or not refilling their hole;
-- not decompressing LZ4 page images;
-- ignoring the prefix or the suffix of compressed updates;
-- reading multi-insert tuples without their 2-byte alignment;
-- using the record xid of COMMIT PREPARED;
-- ignoring committed subtransactions;
-- treating row locks as deletes;
-- treating any multixact member as the deleter;
-- ignoring multixact records in the WAL;
-- assuming pg_class lives in its OID's file;
-- using the TOAST relation OID as its filenode;
-- returning NULL for columns added with a default;
-- ignoring frozen tuples;
-- replaying to the end and filtering by commit time.
-
-Not decompressing pglz page images fails three of the five."""
+Measured with 2 CPUs: the reference scores 1 and answers a dataset's 72 to 81 queries in about 15 seconds, using about 110 MB. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
+- not decoding Zstandard page images;
+- printing float8 with Python's shortest repr;
+- following only the relations present in the backup;
+- mapping a partition's columns by position;
+- reading enum labels from any version of pg_enum rather than the one visible at the instant;
+- treating timeline 3 as a child of timeline 2;
+- dropping non-default array lower bounds;
+- printing jsonb without PostgreSQL's spacing;
+- leaving out the "+" that follows a negative interval field;
+- not resolving the domain to its base type;
+- returning NULL for a partition's fast-default column;
+- replaying to the end and filtering by commit time."""
 category = "Software"
 subcategory = "Databases"
-tags = ["postgresql", "wal", "point-in-time-recovery", "mvcc", "storage-format", "python"]
-expert_time_estimate_hours = 12
+tags = ["postgresql", "wal", "point-in-time-recovery", "mvcc", "storage-format", "zstd", "python"]
+expert_time_estimate_hours = 24
 relevant_experience = "I work on backend services in Python and JavaScript that run on PostgreSQL, and I have dealt with the recovery side of it: restoring rows after bad migrations, point-in-time restores, and reading PostgreSQL internals (WAL records, heap pages, TOAST, transaction status) to understand what happened. I wrote the workload generator that produced these datasets from a real server and the reference tool, and I checked the tool against live query results captured during each run."
 
 [verifier]
