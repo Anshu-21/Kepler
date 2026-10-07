@@ -115,7 +115,7 @@ The `RATE_CHANGE` records of the booking log were lost. For each affected facili
 
 - `logical_id` is a string not used by any record already in the contract, `revision` is an integer, and the revisions of one `logical_id` are distinct.
 - `recorded_at` is an ISO 8601 timestamp with a UTC offset, and `action` is `SET` or `RETRACT`. `booking_id` may be omitted.
-- A `SET` record has `kind` `RATE_CHANGE`, a `tranche_id` of the contract, an `effective_date` strictly inside a period and at least five calendar days from every regular boundary, and `annual_rate` for a fixed tranche or `spread` for a floating one, as a decimal string. Rates are booked as the desk quotes them: an `annual_rate` has at most six decimal places and a `spread` at most four, exactly like the contract's own rates and every booking in the log.
+- A `SET` record has `kind` `RATE_CHANGE`, a `tranche_id` of the contract, an `effective_date` strictly inside a period and at least five calendar days from every regular boundary, and `annual_rate` for a fixed tranche or `spread` for a floating one, as a decimal string. Rates are booked as the desk quotes them, to the basis point: an `annual_rate` or `spread` has at most four decimal places, like the contract's own rates and every booking in the log.
 - A `RETRACT` record has nothing else.
 - There are at most 10,000 records.
 

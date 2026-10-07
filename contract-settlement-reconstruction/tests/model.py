@@ -500,8 +500,8 @@ def _amount(rng, lo, hi):
 
 
 def _rate(rng, lo=4000000, hi=9000000):
-    """A fixed rate as the desk books it, to six decimal places (lo and hi in units of 1e-8)."""
-    return f"0.{rng.randrange(lo // 100, hi // 100):06d}"
+    """A fixed rate as the desk books it, to the basis point: four decimal places (lo and hi in units of 1e-8)."""
+    return f"0.{rng.randrange(lo // 10000, hi // 10000):04d}"
 
 
 def _spread(rng):
@@ -512,7 +512,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
          n_prepay=4, n_changes=6, n_fix=4, waterfall="INTEREST_FIRST", excess_cash="SWEEP",
          cash_mix=(0.08, 0.3, 0.8, 1.0, 1.0, 1.15, 1.4), floor_bias=False, coverage=None,
          collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None, lockout=None,
-         rebook=None, moves=0.0):
+         rebook=None, moves=0.0, scale=1, sparse=False):
     """Build one contract.  day_counts/kinds/seniority give one entry per tranche."""
     rng = random.Random(seed)
     start = parse(opening)
@@ -542,7 +542,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
     lowest = min(int(v.replace(".", "")) for v in fixings.values())
     tranches = []
     for tid, dc, kind, lv in zip(ids, day_counts, kinds, seniority):
-        bal = rng.randrange(100000, 400000)
+        bal = rng.randrange(100000 * scale, 400000 * scale)
         t = {"tranche_id": tid, "seniority": lv, "opening_balance": f"{bal}.{rng.randrange(100):02d}",
              "day_count": dc, "scheduled_principal": f"{bal // (term * 3)}.{rng.randrange(100):02d}"}
         if kind == "FIXED":
@@ -575,7 +575,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
     for n in range(n_prepay):
         k = rng.randrange(1, term)
         c["prepayments"].append({"logical_id": f"PP-{n + 1:03d}", "tranche_id": rng.choice(ids),
-                                 "effective_date": inside(k).isoformat(), "amount": _amount(rng, 3000, 25000)})
+                                 "effective_date": inside(k).isoformat(), "amount": _amount(rng, 3000 * scale, 25000 * scale)})
     floating = {t["tranche_id"] for t in tranches if t["rate"]["type"] == "FLOATING"}
     bookings = []
 
@@ -714,6 +714,28 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
             b["fixing"] = f"{v // 100}.{v % 100:02d}"
             return b
         revise(lid, body, rec, k, alter)
+    if sparse:
+        # keep at most one rate event per tranche between consecutive determination dates
+        cut = [cutoff(r["determination"]) for r in rows]
+        first = {}
+        for e in bookings:
+            if e["action"] == "SET" and e.get("kind") == "RATE_CHANGE":
+                first.setdefault(e["logical_id"], e["tranche_id"])
+        taken, kept, live_tranche = set(), [], {}
+        for e in sorted(bookings, key=lambda e: (instant(e["recorded_at"]), e["logical_id"], e["revision"])):
+            if e["logical_id"] not in first:
+                kept.append(e); continue
+            w = next((i for i, c in enumerate(cut) if instant(e["recorded_at"]) <= c), len(cut))
+            touched = {first[e["logical_id"]], live_tranche.get(e["logical_id"], first[e["logical_id"]])}
+            if e["action"] == "SET":
+                touched.add(e["tranche_id"])
+            if any((t, w) in taken for t in touched):
+                continue
+            taken.update((t, w) for t in touched)
+            if e["action"] == "SET":
+                live_tranche[e["logical_id"]] = e["tranche_id"]
+            kept.append(e)
+        bookings[:] = kept
     for e, eid in zip(bookings, rng.sample(range(10000, 99999), len(bookings))):
         e["booking_id"] = eid
     rng.shuffle(bookings); rng.shuffle(c["prepayments"])
