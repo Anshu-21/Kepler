@@ -79,7 +79,7 @@ Only the Python 3.13 standard library is available.
 
 ## Material in this directory
 
-* `datasets/staging/` is a staging cluster that went through the same kind of history. `datasets/staging-checks.json` holds what `SELECT *` really returned there at two instants, captured live at the time.
+* `datasets/staging/` is a staging cluster that went through the same kind of history. `datasets/staging-checks.json` holds what `SELECT * FROM orders` and `SELECT * FROM shipments` really returned there at two instants, captured live at the time.
 * `datasets/prod/` is the production copy. Nobody knows its answers.
 * `reference/postgresql-16/` has the relevant PostgreSQL 16 sources (PostgreSQL License, see `COPYRIGHT`).
 * `reference/lz4-block-format.md` describes LZ4 blocks.
