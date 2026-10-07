@@ -1,0 +1,76 @@
+artifacts = ["/app/rewind.py"]
+
+[task]
+name = "afterquery/pg-wal-rewind"
+
+[metadata]
+author_name = "Anshu Kumar"
+author_email = "kumaranshu303393@gmail.com"
+difficulty_explanation = """Every dataset was produced by a real PostgreSQL 16.15 server running a synthetic, seeded order workload written for this task; no production data is involved.
+
+This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive: answering "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after an earlier point-in-time restore forked the cluster onto a second timeline. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow; here none is installed, and the agent has to build that reader from the PostgreSQL sources shipped in the environment.
+
+One correct answer needs all of the following:
+- the WAL page and record format: long and short page headers, records that cross page and 1 MB segment boundaries, block references with forks, page images with holes, compressed with pglz or LZ4 depending on when they were written, and the redo rules for the heap (insert, multi-insert from COPY, update and HOT update with prefix and suffix taken from the old tuple, delete, lock, speculative-insert confirmation, prune, vacuum, freeze, in-place catalog updates);
+- the transaction rules: commit and abort records with subtransactions, COMMIT PREPARED records whose committed xid is the prepared transaction's rather than the record's, multixacts whose members come from WAL records or from the backed-up pg_multixact, lock-only xmax, frozen tuples, and transaction ids that wrap past 2^32 in three of the five sealed datasets;
+- point-in-time recovery semantics as of an instant, since replaying to the end and filtering afterwards loses the versions VACUUM removed;
+- the two timelines: the history file, segments of both timelines for the same positions, and which timeline was live at the instant;
+- the catalog as of the instant: pg_class and pg_attribute are found through pg_filenode.map (both were rewritten), table and TOAST filenodes differ from their OIDs, columns are added and dropped in the window with fast defaults stored as arrays in attmissingval, and the namespace must be checked because another schema has a table of the same name;
+- the values themselves: alignment, null bitmaps, short and external varlenas, TOAST with pglz and LZ4, numeric with its display scale, timestamps and dates.
+
+Each of these is documented somewhere in the sources, but nothing assembles them, and one mistake changes the answer. The staging dataset has live answers at only two early instants, before the restore, before most of the DDL and long before the bad job. Most of the history has to be gotten right by reasoning. A PostgreSQL internals expert would need a full working day or more."""
+solution_explanation = """Read the archive: list the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs. Decide which timeline answers an instant. A timeline is live from its first commit record after its branch point; timeline 1 is live before that. Then replay that timeline's path from the backup.
+
+Load the backed-up pages of the shipped relations. Read records from the backup label's start LSN: skip page headers, join records that span pages, and follow XLOG_SWITCH to the next segment. Decode the block references, and restore page images after decompressing them and refilling the hole. Apply heap and heap2 redo on a per-page model of line pointers and tuple bytes, skipping blocks whose page LSN is already past the record. For each commit, or for a commit-prepared record (taking the prepared xid), store the commit time for the xid and its subtransactions. Keep the multixact members from CREATE_ID records. Stop just before the first commit later than the instant.
+
+Visibility at that point: a version counts if its xmin is frozen or committed, and its xmax is absent, lock-only, a multixact without a committed updater, or uncommitted. Transactions older than the backup's checkpoint use the backed-up pg_xact; older multixacts use pg_multixact. Read pg_class, pg_namespace and pg_attribute through pg_filenode.map with the same rule to get the table's filenode, its TOAST filenode and its columns as of the instant. Then decode each tuple. Walk dropped columns too, honour the null bitmap and the varlena alignment rule, use attmissingval for attributes past the tuple's natts, and detoast through the TOAST relation. Render values in the server's text format."""
+verification_explanation = """Each of the five sealed datasets was produced by tests/generator/make_dataset.py with PostgreSQL 16.15. The script works as follows:
+- It builds a cluster with 1 MB segments and WAL archiving. In most seeds (three of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
+- It loads the schema and rewrites orders, pg_class and pg_attribute with VACUUM FULL.
+- It takes a pg_basebackup while sessions keep writing.
+- It then runs a seeded workload of three to five interleaved sessions: inserts, upserts, COPY, HOT and non-HOT updates (toasted and not), deletes, FOR UPDATE and FOR KEY SHARE locks that become multixacts, savepoints rolled back and released, PREPARE TRANSACTION with later COMMIT or ROLLBACK PREPARED, checkpoints, changes of wal_compression, VACUUM and VACUUM FREEZE, and column additions and drops.
+- Partway through, it stops the server, restores the base backup to an earlier instant, and continues on timeline 2. Timeline 1's later WAL is left in the archive.
+- On timeline 2 it runs more of the same, a bad bulk update and delete, and the VACUUM that removes the old versions. It ends with one transaction left open and one prepared.
+
+Throughout, the script captured the live result of SELECT * of both tables, with every value cast to text and TimeZone set to UTC, at about twenty instants chosen when no transaction was committing. These cover both timelines and every phase. Those results are the expected answers, stored per query as the column list, a row count and the sorted row hashes.
+
+The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR` in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
+
+Measured in Docker with 2 CPUs: the reference scores 1 and answers a dataset's 40 queries in about 6 seconds; the skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
+- always answering from the newest timeline, or always from the oldest;
+- switching timelines at the restore target in the history file instead of at the new timeline's first commit;
+- ignoring page images, or not refilling their hole;
+- not decompressing LZ4 page images;
+- ignoring the prefix or the suffix of compressed updates;
+- reading multi-insert tuples without their 2-byte alignment;
+- using the record xid of COMMIT PREPARED;
+- ignoring committed subtransactions;
+- treating row locks as deletes;
+- treating any multixact member as the deleter;
+- ignoring multixact records in the WAL;
+- assuming pg_class lives in its OID's file;
+- using the TOAST relation OID as its filenode;
+- returning NULL for columns added with a default;
+- ignoring frozen tuples;
+- replaying to the end and filtering by commit time.
+
+Not decompressing pglz page images fails three of the five."""
+category = "Software"
+subcategory = "Databases"
+tags = ["postgresql", "wal", "point-in-time-recovery", "mvcc", "storage-format", "python"]
+expert_time_estimate_hours = 12
+relevant_experience = "I work on backend services in Python and JavaScript that run on PostgreSQL, and I have dealt with the recovery side of it: restoring rows after bad migrations, point-in-time restores, and reading PostgreSQL internals (WAL records, heap pages, TOAST, transaction status) to understand what happened. I wrote the workload generator that produced these datasets from a real server and the reference tool, and I checked the tool against live query results captured during each run."
+
+[verifier]
+timeout_sec = 1500.0
+environment_mode = "separate"
+
+[agent]
+timeout_sec = 10800.0
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
