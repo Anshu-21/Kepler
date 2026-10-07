@@ -6,13 +6,17 @@
   1e-6 of a half unit, so a Decimal implementation and an exact one cannot
   disagree on a cent (withholding and reserve targets are exact products);
 * the contracts reach the cases a formula shortcut gets wrong: gross-ups
-  that differ from ceil(net / (1 - rate)) and from its rounding, and reserve
-  top-ups that change the sweep they are sized on.
+  that differ from ceil(net / (1 - rate)) and from its rounding, reserve
+  top-ups that change the sweep they are sized on, bookings whose knowledge
+  flips under a local-date, fixed-offset or exclusive cutoff, ICMA accrual
+  periods that span two regular periods, and lockouts inside a period that
+  is split by a segment.
 """
 import sys
 from datetime import timedelta
 from fractions import Fraction as F
-from model import Audit, add_months, is_business, parse
+from datetime import datetime, timezone
+from model import Audit, add_months, cutoff, instant, is_business, parse, schedule
 import cases
 
 audit = Audit()
@@ -54,6 +58,28 @@ for contract, _ in pairs:
     for t in tr:
         if t["rate"]["type"] == "FLOATING":
             assert 2 <= t["rate"]["lookback_days"] <= 5, cid
+flip_local = flip_fixed = flip_edge = icma_span = locked_split = 0
+for contract, _ in pairs:
+    rows = schedule(contract)
+    dets = sorted({r["determination"] for r in rows})
+    for e in contract["bookings"]:
+        moment = instant(e["recorded_at"])
+        local = parse(e["recorded_at"][:10])
+        for d in dets:
+            truth = moment <= cutoff(d)
+            flip_local += truth != (local <= d)
+            flip_fixed += truth != (moment <= datetime(d.year, d.month, d.day, 22, tzinfo=timezone.utc)) or \
+                truth != (moment <= datetime(d.year, d.month, d.day, 21, tzinfo=timezone.utc))
+            flip_edge += moment == cutoff(d)
+    start = parse(contract["opening_date"])
+    regular = {add_months(start, k, contract["anchor_day"]) for k in range(1, contract["term_months"] + 2)}
+    dcs = {t["day_count"] for t in contract["tranches"]}
+    if "ACT/ACT ICMA" in dcs:
+        icma_span += sum(1 for r in rows if any(r["start"] < x < r["end"] for x in regular))
+    if any("lockout_days" in t["rate"] for t in contract["tranches"]):
+        locked_split += len(contract["prepayments"])
+assert flip_local >= 50 and flip_fixed >= 50 and flip_edge >= 5 and icma_span >= 20 and locked_split >= 20, \
+    (flip_local, flip_fixed, flip_edge, icma_span, locked_split)
 off_ceil = off_round = circular = 0
 for contract, want in pairs:
     rates = {t["tranche_id"]: F(t.get("withholding_rate", "0")) for t in contract["tranches"]}
@@ -69,4 +95,5 @@ for contract, want in pairs:
             circular += 1
 assert off_ceil >= 100 and off_round >= 20 and circular >= 5, (off_ceil, off_round, circular)
 print("sealed contracts ok", digest, f"closest rounding {float(audit.closest):.3g}",
-      f"gross-ups off ceil {off_ceil}, off round {off_round}, top-ups against a sweep {circular}")
+      f"gross-ups off ceil {off_ceil}, off round {off_round}, top-ups against a sweep {circular}",
+      f"cutoff flips local {flip_local} fixed {flip_fixed} exact {flip_edge}, ICMA spans {icma_span}")

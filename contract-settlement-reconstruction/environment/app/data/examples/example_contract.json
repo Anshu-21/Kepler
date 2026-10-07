@@ -315,81 +315,77 @@
  ],
  "bookings": [
   {
+   "logical_id": "RC-003",
+   "revision": 2,
+   "action": "SET",
+   "recorded_at": "2028-09-21T15:18:43+01:00",
+   "kind": "RATE_CHANGE",
+   "tranche_id": "A",
+   "effective_date": "2028-05-05",
+   "spread": "0.0385",
+   "booking_id": 6487
+  },
+  {
+   "logical_id": "RC-002",
+   "revision": 2,
+   "action": "RETRACT",
+   "recorded_at": "2029-01-25T18:52:24-04:00",
+   "booking_id": 3966
+  },
+  {
+   "logical_id": "RC-002",
+   "revision": 1,
+   "action": "SET",
+   "recorded_at": "2028-10-29T22:02:39-07:00",
+   "kind": "RATE_CHANGE",
+   "tranche_id": "C",
+   "effective_date": "2028-10-23",
+   "annual_rate": "0.08572426",
+   "booking_id": 6076
+  },
+  {
+   "logical_id": "RC-003",
+   "revision": 1,
+   "action": "SET",
+   "recorded_at": "2028-05-01T04:21:12+09:00",
+   "kind": "RATE_CHANGE",
+   "tranche_id": "A",
+   "effective_date": "2028-05-05",
+   "spread": "0.0353",
+   "booking_id": 5768
+  },
+  {
    "logical_id": "RC-001",
    "revision": 1,
    "action": "SET",
-   "recorded_at": "2028-10-29",
+   "recorded_at": "2028-10-29T03:44:55-05:00",
    "kind": "RATE_CHANGE",
    "tranche_id": "B",
    "effective_date": "2028-11-20",
    "annual_rate": "0.04664952",
-   "booking_id": 8866
-  },
-  {
-   "logical_id": "RC-003",
-   "revision": 2,
-   "action": "SET",
-   "recorded_at": "2028-12-21",
-   "kind": "RATE_CHANGE",
-   "tranche_id": "A",
-   "effective_date": "2028-10-12",
-   "spread": "0.0353",
-   "booking_id": 7569
-  },
-  {
-   "logical_id": "RC-002",
-   "revision": 1,
-   "action": "SET",
-   "recorded_at": "2028-07-03",
-   "kind": "RATE_CHANGE",
-   "tranche_id": "C",
-   "effective_date": "2028-07-13",
-   "annual_rate": "0.07348057",
-   "booking_id": 1583
-  },
-  {
-   "logical_id": "RC-002",
-   "revision": 2,
-   "action": "SET",
-   "recorded_at": "2028-10-21",
-   "kind": "RATE_CHANGE",
-   "tranche_id": "C",
-   "effective_date": "2028-07-13",
-   "annual_rate": "0.02383094",
-   "booking_id": 2305
-  },
-  {
-   "logical_id": "RC-003",
-   "revision": 1,
-   "action": "SET",
-   "recorded_at": "2028-12-20",
-   "kind": "RATE_CHANGE",
-   "tranche_id": "A",
-   "effective_date": "2028-10-12",
-   "spread": "0.0279",
-   "booking_id": 5354
+   "booking_id": 3874
   }
  ],
  "collections": [
-  "44172.02",
-  "44074.69",
-  "49568.07",
-  "49265.25",
-  "43037.68",
-  "46563.51",
-  "46248.71",
-  "40655.35",
-  "576582.63"
+  "50459.42",
+  "44324.62",
+  "49907.77",
+  "43703.39",
+  "43778.04",
+  "48928.77",
+  "48764.32",
+  "42154.88",
+  "576729.23"
  ],
  "collateral": [
-  "1373622.75",
-  "1094969.48",
-  "1067399.05",
-  "831135.68",
-  "990200.67",
-  "1185841.87",
-  "801987.48",
-  "625094.89",
-  "957937.01"
+  "1138682.50",
+  "998508.87",
+  "1044855.21",
+  "881026.95",
+  "1228130.24",
+  "1027830.56",
+  "973239.57",
+  "749742.72",
+  "831640.67"
  ]
 }

@@ -23,9 +23,9 @@ Effective dates of prepayments and rate changes fall strictly inside a period, a
 
 ## Rate bookings and what is known when
 
-`bookings` is an append-only log of `RATE_CHANGE` and `FIXING_CORRECTION` records. Every record has `booking_id`, `logical_id`, `revision`, `recorded_at` (a date) and `action`. Revisions of one logical booking are distinct integers. `SET` records carry `kind` and its fields; `RETRACT` records carry nothing else.
+`bookings` is an append-only log of `RATE_CHANGE` and `FIXING_CORRECTION` records. Every record has `booking_id`, `logical_id`, `revision`, `recorded_at` and `action`. `recorded_at` is an ISO 8601 timestamp with a UTC offset (`Z` or `±HH:MM`); the desk records from several offices, so the offsets vary. Revisions of one logical booking are distinct integers. `SET` records carry `kind` and its fields; `RETRACT` records carry nothing else.
 
-Period `k` is settled with what is known on its determination date: only records with `recorded_at` on or before that date exist. For each `logical_id` the record with the highest `revision` among those wins; a winning `RETRACT` means the booking does not exist. `booking_id`, log order and recording order carry no meaning.
+Period `k` is settled with what is known at the close of its determination date, 17:00 New York time on that date: only records whose `recorded_at` is at or before that instant exist. New York is at UTC-04:00 from the second Sunday of March up to, but not including, the first Sunday of November, and at UTC-05:00 otherwise. For each `logical_id` the record with the highest `revision` among those wins; a winning `RETRACT` means the booking does not exist. `booking_id`, log order and recording order carry no meaning.
 
 - `RATE_CHANGE`: from `effective_date`, `annual_rate` replaces a fixed tranche's rate, or `spread` replaces a floating tranche's spread.
 - `FIXING_CORRECTION`: `fixing` replaces the published fixing for `fixing_date`. No two logical corrections share a date.
@@ -41,12 +41,14 @@ Fixed tranches use `annual_rate`. Floating tranches use `max(compounded, floor) 
 - A rate business day is a weekday not listed in `rate_holidays`. This is a different calendar from the payment calendar.
 - Every calendar day `t` in `[a, b)` belongs to the latest rate business day on or before `t` (which may fall before `a`). Days belonging to the same rate business day `i` form one run of `n_i` days.
 - The fixing for that run is the one for the rate business day `lookback_days` rate business days before `i`. `fixings` maps ISO dates to percentages: `"4.53"` means 0.0453.
+- A floating tranche may have `lockout_days` `L`. Its lockout days in a period are the last `L` rate business days before that period's accrual end. A run whose rate business day is a lockout day takes the fixing of the rate business day just before the first lockout day instead, with the lookback applied from there. This is fixed by the period, so a segment that ends before the period does is still locked out on any lockout days it contains. Without the field there is no lockout.
 - `compounded = (product over runs of (1 + fixing * n_i / 360) - 1) * 360 / D`, with `D` the calendar days from `a` to `b`, rounded half up to seven decimal places. This 360 is the SOFR convention and does not depend on the tranche's day count.
 
 Year fractions, with `a = Y1-M1-D1` and `b = Y2-M2-D2`:
 
 - `ACT/360`: actual days / 360. `ACT/365F`: actual days / 365.
 - `ACT/ACT ISDA`: days falling in each calendar year divided by that year's length (366 in a leap year, else 365), summed.
+- `ACT/ACT ICMA`: the days of `[a, b)` that fall in each regular period, divided by 12 times that regular period's length in days, summed. Regular period `k` runs from regular boundary `k - 1` to regular boundary `k`, with boundary 0 the opening date and boundary `term_months + 1` computed the same way. Regular periods are never adjusted, even when accrual dates are, so an adjusted accrual period or one of its segments can span two of them.
 - `30/360`: `D1 = min(D1, 30)`; if `D2` is 31 and `D1` is 30, `D2 = 30`.
 - `30E/360`: `D1 = min(D1, 30)`, `D2 = min(D2, 30)`.
 - `30E/360 ISDA`: `D1 = 30` if `a` is the last day of its month; `D2 = 30` if `b` is the last day of its month, unless `b` is the termination date and in February. Otherwise days above 30 become 30. The termination date is the accrual end of the final period.
@@ -109,7 +111,7 @@ Money values are strings with exactly two decimals and a leading `-` only when n
 
 ## Bounds
 
-Every contract, including the verifier's, has two to ten tranches, `term_months` between 6 and 360, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, withholding rates below 0.5, at most 640 bookings and 80 prepayments, and fixings for every date a replay looks up.
+Every contract, including the verifier's, has two to ten tranches, `term_months` between 6 and 360, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 640 bookings and 80 prepayments, and fixings for every date a replay looks up.
 
 ## Runtime
 

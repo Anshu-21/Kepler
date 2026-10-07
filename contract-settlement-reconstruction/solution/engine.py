@@ -21,7 +21,7 @@ top-up changes the sweep its own target is sized on.
 """
 import bisect
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, ROUND_DOWN
 
 from calendar_tools import add_months, modified_following, parse
@@ -87,7 +87,13 @@ def _last_day(day):
     return day.day == calendar.monthrange(day.year, day.month)[1]
 
 
-def year_fraction(convention, a, b, termination):
+def regular_boundaries(contract):
+    """Unadjusted boundaries 0 .. term + 1; the last only bounds the notional period after maturity."""
+    start, anchor = parse(contract["opening_date"]), int(contract["anchor_day"])
+    return [start] + [add_months(start, n, anchor) for n in range(1, int(contract["term_months"]) + 2)]
+
+
+def year_fraction(convention, a, b, termination, regular):
     days = (b - a).days
     if convention == "ACT/360":
         return Decimal(days) / 360
@@ -99,6 +105,16 @@ def year_fraction(convention, a, b, termination):
             stop = min(b, date(cursor.year + 1, 1, 1))
             total += Decimal((stop - cursor).days) / (366 if calendar.isleap(cursor.year) else 365)
             cursor = stop
+        return total
+    if convention == "ACT/ACT ICMA":
+        total = ZERO
+        j = max(1, bisect.bisect_right(regular, a))
+        while j < len(regular) and regular[j - 1] < b:
+            lo, hi = regular[j - 1], regular[j]
+            days = (min(b, hi) - max(a, lo)).days
+            if days > 0:
+                total += Decimal(days) / (12 * (hi - lo).days)
+            j += 1
         return total
     d1, d2 = a.day, b.day
     if convention == "30/360":
@@ -118,31 +134,48 @@ def year_fraction(convention, a, b, termination):
     return Decimal(360 * (b.year - a.year) + 30 * (b.month - a.month) + d2 - d1) / 360
 
 
-def interest_amount(balance, rate, convention, a, b, termination):
+def interest_amount(balance, rate, convention, a, b, termination, regular):
     """Round once: balance * rate * fraction, with the fraction's division last."""
     if convention in ("ACT/360", "ACT/365F"):
         value = balance * rate * (b - a).days / (360 if convention == "ACT/360" else 365)
     else:
-        value = balance * rate * year_fraction(convention, a, b, termination)
+        value = balance * rate * year_fraction(convention, a, b, termination, regular)
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
+
+
+def _second_sunday_march_and_first_sunday_november(year):
+    march, november = date(year, 3, 1), date(year, 11, 1)
+    return (march + timedelta(days=(6 - march.weekday()) % 7 + 7),
+            november + timedelta(days=(6 - november.weekday()) % 7))
+
+
+def cutoff(day):
+    """17:00 New York time on a determination date, in UTC."""
+    begins, ends = _second_sunday_march_and_first_sunday_november(day.year)
+    hour = 21 if begins <= day < ends else 22
+    return datetime(day.year, day.month, day.day, hour, tzinfo=timezone.utc)
+
+
+def instant(stamp):
+    return datetime.fromisoformat(stamp).astimezone(timezone.utc)
 
 
 class BookingLog:
     """Winning bookings as the knowledge date moves forward, with what changed."""
 
     def __init__(self, contract):
-        self.records = sorted(contract["bookings"], key=lambda r: r["recorded_at"])
+        self.records = sorted(((instant(r["recorded_at"]), r) for r in contract["bookings"]), key=lambda x: x[0])
         self.next = 0
         self.winners = {}
         self.live = {}
 
-    def advance(self, day):
-        """Admit records up to day; return (old, new) live records of each changed booking."""
+    def advance(self, moment):
+        """Admit records up to moment; return (old, new) live records of each changed booking."""
         touched = set()
-        while self.next < len(self.records) and self.records[self.next]["recorded_at"] <= day:
-            record = self.records[self.next]
+        while self.next < len(self.records) and self.records[self.next][0] <= moment:
+            record = self.records[self.next][1]
             self.next += 1
             held = self.winners.get(record["logical_id"])
             if held is None or int(record["revision"]) > int(held["revision"]):
@@ -180,23 +213,27 @@ class Knowledge:
         hit = self.corrections.get(day)
         return hit if hit is not None else self.base[day]
 
-    def compounded(self, a, b, lookback):
-        key = (a, b, lookback)
+    def compounded(self, a, b, lookback, end, lockout):
+        """Segment [a, b) of a period ending at end; lockout days count back from end, not b."""
+        key = (a, b, lookback, end, lockout)
         if key not in self.cache:
             cal, factor, day = self.rate_cal, Decimal(1), a
+            locked = cal.previous(end, lockout) if lockout else None
             while day < b:
                 base = cal.on_or_before(day)
                 run = 0
                 while day < b and cal.on_or_before(day) == base:
                     run += 1
                     day += timedelta(days=1)
+                if locked is not None and base >= locked:
+                    base = cal.previous(locked, 1)
                 factor *= 1 + self.fixing(cal.previous(base, lookback)) * run / 360
             rate = (factor - 1) * 360 / (b - a).days
             self.cache[key] = rate.quantize(RATE_STEP, rounding=ROUND_HALF_UP)
         return self.cache[key]
 
 
-def accrue(prepayments, know, tranche, period, opening, termination, margin):
+def accrue(prepayments, know, tranche, period, opening, termination, margin, regular):
     """Interest of one tranche over one period; returns (interest, balance at accrual end)."""
     tid, terms = tranche["tranche_id"], tranche["rate"]
     start, end = period["start"], period["end"]
@@ -223,10 +260,11 @@ def accrue(prepayments, know, tranche, period, opening, termination, margin):
         if a >= b or bal == 0:
             return ZERO
         if floating:
-            rate = max(know.compounded(a, b, int(terms["lookback_days"])), Decimal(terms["floor"])) + lvl + margin
+            rate = max(know.compounded(a, b, int(terms["lookback_days"]), end, int(terms.get("lockout_days", 0))),
+                       Decimal(terms["floor"])) + lvl + margin
         else:
             rate = lvl + margin
-        return interest_amount(bal, rate, tranche["day_count"], a, b, termination)
+        return interest_amount(bal, rate, tranche["day_count"], a, b, termination, regular)
 
     balance, cursor, total = opening, start, ZERO
     inside = [b for b in breaks if b[2] != "pre"]
@@ -359,6 +397,7 @@ def smallest_cent(limit, ok):
 def reconcile(contract):
     schedule = build_schedule(contract)
     termination = schedule[-1]["end"]
+    regular = regular_boundaries(contract)
     tranches = contract["tranches"]
     ids = [t["tranche_id"] for t in tranches]
     levels = {}
@@ -388,7 +427,7 @@ def reconcile(contract):
     for idx, period in enumerate(schedule):
         number = period["number"]
         final = number == len(schedule)
-        restate.invalidate(log.advance(period["determination"].isoformat()))
+        restate.invalidate(log.advance(cutoff(period["determination"])))
         know = Knowledge(contract, log.live, base_fixings, rate_cal)
         openings.append(dict(balance))
         margins.append({tid: margin_rate if deferred[tid] > 0 else ZERO for tid in ids})
@@ -396,7 +435,7 @@ def reconcile(contract):
         for t in tranches:
             tid = t["tranche_id"]
             restated, (interest, after) = restate.refresh(
-                tid, idx, lambda j: accrue(prepayments, know, t, schedule[j], openings[j][tid], termination, margins[j][tid]))
+                tid, idx, lambda j: accrue(prepayments, know, t, schedule[j], openings[j][tid], termination, margins[j][tid], regular))
             true_up = restated - recognised[tid]
             recognised[tid] = restated + interest
             current = interest + true_up + credit[tid]

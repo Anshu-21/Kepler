@@ -6,10 +6,10 @@ no code with the candidate engine.  `make` builds one contract from a seed and
 a feature mix; `settle` produces the statement the specification implies.
 """
 from fractions import Fraction as F
-from datetime import date, timedelta
-import calendar, random
+from datetime import date, datetime, timedelta, timezone
+import calendar, functools, random
 
-DAY_COUNTS = ("ACT/360", "ACT/365F", "ACT/ACT ISDA", "30/360", "30E/360", "30E/360 ISDA")
+DAY_COUNTS = ("ACT/360", "ACT/365F", "ACT/ACT ISDA", "ACT/ACT ICMA", "30/360", "30E/360", "30E/360 ISDA")
 
 
 def parse(x):
@@ -50,7 +50,7 @@ def last_of_month(d):
     return d.day == calendar.monthrange(d.year, d.month)[1]
 
 
-def fraction(a, b, conv, termination):
+def fraction(a, b, conv, termination, regular=None):
     if conv == "ACT/360":
         return F((b - a).days, 360)
     if conv == "ACT/365F":
@@ -62,6 +62,13 @@ def fraction(a, b, conv, termination):
             nxt = min(b, date(cur.year + 1, 1, 1))
             total += F((nxt - cur).days, 366 if calendar.isleap(cur.year) else 365)
             cur = nxt
+        return total
+    if conv == "ACT/ACT ICMA":
+        total = F(0)
+        for lo, hi in zip(regular, regular[1:]):
+            days = (min(b, hi) - max(a, lo)).days
+            if days > 0:
+                total += F(days, 12 * (hi - lo).days)
         return total
     d1, d2 = a.day, b.day
     if conv == "30/360":
@@ -105,10 +112,33 @@ def money(x):
     return f"{sign}{cents // 100}.{cents % 100:02d}"
 
 
+def nth_sunday(year, month, n):
+    first = date(year, month, 1)
+    return first + timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def cutoff(day):
+    """17:00 New York time on day, as an aware UTC instant."""
+    summer = nth_sunday(day.year, 3, 2) <= day < nth_sunday(day.year, 11, 1)
+    return datetime(day.year, day.month, day.day, 21 if summer else 22, tzinfo=timezone.utc)
+
+
+def instant(stamp):
+    return datetime.fromisoformat(stamp).astimezone(timezone.utc)
+
+
+@functools.lru_cache(maxsize=None)
+def regular_boundaries(opening, anchor, term):
+    """Unadjusted boundaries 0 .. term + 1 (the last one only bounds a notional period)."""
+    start = parse(opening)
+    return tuple([start] + [add_months(start, n, anchor) for n in range(1, term + 2)])
+
+
 def known_bookings(c, knowledge):
     best = {}
+    limit = cutoff(parse(knowledge))
     for e in c["bookings"]:
-        if e["recorded_at"] > knowledge:
+        if instant(e["recorded_at"]) > limit:
             continue
         key = e["logical_id"]
         if key not in best or e["revision"] > best[key]["revision"]:
@@ -130,8 +160,9 @@ def schedule(c):
     return rows
 
 
-def compounded(c, fix, a, b, lookback, audit):
+def compounded(c, fix, a, b, lookback, audit, end=None, lockout=0):
     rh = set(c["rate_holidays"])
+    locked = back_business(end, lockout, rh) if lockout else None
     product = F(1); t = a
     while t < b:
         base = t
@@ -140,6 +171,8 @@ def compounded(c, fix, a, b, lookback, audit):
         n = 0
         while t < b and (t == base or not is_business(t, rh)):
             n += 1; t += timedelta(days=1)
+        if locked is not None and base >= locked:
+            base = back_business(locked, 1, rh)
         obs = back_business(base, lookback, rh)
         product *= 1 + F(fix[obs.isoformat()]) / 100 * n / 360
     return audit.half_up((product - 1) * F(360, (b - a).days), RATE_UNIT)
@@ -179,6 +212,7 @@ def accrue_period(c, know, row, tranche, opening_balance, termination, audit, ma
             moves.append((e["effective_date"], 0, e["logical_id"], e))
     moves.sort(key=lambda m: (m[0], m[2]))
     bal = opening_balance; cursor = S; total = F(0)
+    regular = regular_boundaries(c["opening_date"], int(c["anchor_day"]), int(c["term_months"]))
 
     def seg(a, b):
         if a >= b:
@@ -186,8 +220,9 @@ def accrue_period(c, know, row, tranche, opening_balance, termination, audit, ma
         if fixed is not None:
             rate = fixed + margin
         else:
-            rate = max(compounded(c, know.fixings, a, b, int(terms["lookback_days"]), audit), F(terms["floor"])) + spread + margin
-        return audit.half_up(bal * rate * fraction(a, b, tranche["day_count"], termination), CENT)
+            rate = max(compounded(c, know.fixings, a, b, int(terms["lookback_days"]), audit, E,
+                                  int(terms.get("lockout_days", 0))), F(terms["floor"])) + spread + margin
+        return audit.half_up(bal * rate * fraction(a, b, tranche["day_count"], termination, regular), CENT)
 
     for d in sorted({m[0] for m in moves}):
         day = parse(d)
@@ -427,6 +462,9 @@ def settle(c, audit=None, cash_rule=None):
 
 # ---------------------------------------------------------------- generator
 
+OFFSETS = (0, 0, -300, -240, -420, 60, 330, 540, -180)
+
+
 def _amount(rng, lo, hi):
     return f"{rng.randrange(lo, hi)}.{rng.randrange(100):02d}"
 
@@ -442,7 +480,7 @@ def _spread(rng):
 def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniority, notice_days=2,
          n_prepay=4, n_changes=6, n_fix=4, waterfall="INTEREST_FIRST", excess_cash="SWEEP",
          cash_mix=(0.08, 0.3, 0.8, 1.0, 1.0, 1.15, 1.4), floor_bias=False, coverage=None,
-         collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None):
+         collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None, lockout=None):
     """Build one contract.  day_counts/kinds/seniority give one entry per tranche."""
     rng = random.Random(seed)
     start = parse(opening)
@@ -481,6 +519,8 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
             floor = (lowest + rng.randrange(20, 60)) if floor_bias else rng.choice((0, 0, 100, 250))
             t["rate"] = {"type": "FLOATING", "index": "SOFR", "spread": _spread(rng),
                          "floor": f"0.{floor:04d}", "lookback_days": rng.randrange(2, 6)}
+        if lockout and tid in lockout:
+            t["rate"]["lockout_days"] = lockout[tid]
         if withholding and tid in withholding:
             t["withholding_rate"] = withholding[tid]
         tranches.append(t)
@@ -507,27 +547,51 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
     floating = {t["tranche_id"] for t in tranches if t["rate"]["type"] == "FLOATING"}
     bookings = []
 
+    def at(day):
+        return datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(seconds=rng.randrange(86400))
+
+    def near_cutoff(day):
+        # within the hour either side of 17:00 New York, where a fixed offset or a local date goes wrong
+        roll = rng.random()
+        if roll < 0.1:
+            return cutoff(day)
+        return cutoff(day) + timedelta(seconds=rng.choice((-1, 1)) * rng.randrange(1, 3600))
+
+    def stamp(moment):
+        offset = rng.choice(OFFSETS)
+        local = moment.astimezone(timezone(timedelta(minutes=offset)))
+        text = local.replace(tzinfo=None).isoformat(timespec="seconds")
+        if offset == 0 and rng.random() < 0.5:
+            return text + "Z"
+        sign = "-" if offset < 0 else "+"
+        return f"{text}{sign}{abs(offset) // 60:02d}:{abs(offset) % 60:02d}"
+
     def booked(k, pattern):
         row = rows[k - 1]
         if pattern == "advance":
-            return row["start"] + timedelta(days=rng.randrange(0, 8))
+            return at(row["start"] + timedelta(days=rng.randrange(0, 8)))
         if pattern == "edge_det":
-            return row["determination"]
+            return near_cutoff(row["determination"])
         if pattern == "edge_pay":
-            return row["payment"]
+            return at(row["payment"])
         later = rows[min(term - 1, k + rng.randrange(0, 3))]
-        return later["determination"] - timedelta(days=rng.randrange(0, 12))
+        if rng.random() < 0.3:
+            return near_cutoff(later["determination"])
+        return at(later["determination"] - timedelta(days=rng.randrange(0, 12)))
 
     def revise(lid, body, rec, k, alter):
         roll = rng.random()
-        if roll < 0.45:
-            later = rows[min(term - 1, k + rng.randrange(0, 4))]
-            r2 = max(rec + timedelta(days=1), later["determination"] - timedelta(days=rng.randrange(-3, 10)))
-            bookings.append({"logical_id": lid, "revision": 2, "action": "SET", "recorded_at": r2.isoformat(), **alter(dict(body))})
-        elif roll < 0.62:
-            later = rows[min(term - 1, k + rng.randrange(1, 4))]
-            r2 = max(rec + timedelta(days=1), later["determination"] - timedelta(days=rng.randrange(0, 6)))
-            bookings.append({"logical_id": lid, "revision": 2, "action": "RETRACT", "recorded_at": r2.isoformat()})
+        if roll < 0.62:
+            later = rows[min(term - 1, k + rng.randrange(0 if roll < 0.45 else 1, 4))]
+            if rng.random() < 0.35:
+                r2 = near_cutoff(later["determination"])
+            else:
+                r2 = at(later["determination"] - timedelta(days=rng.randrange(-3, 10)))
+            r2 = max(rec + timedelta(minutes=rng.randrange(1, 90)), r2)
+            if roll < 0.45:
+                bookings.append({"logical_id": lid, "revision": 2, "action": "SET", "recorded_at": stamp(r2), **alter(dict(body))})
+            else:
+                bookings.append({"logical_id": lid, "revision": 2, "action": "RETRACT", "recorded_at": stamp(r2)})
 
     for n in range(n_changes):
         k = rng.randrange(1, term); tid = rng.choice(ids)
@@ -538,7 +602,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
             body["annual_rate"] = _rate(rng, 1000000 if rng.random() < 0.3 else 4000000, 9500000)
         rec = booked(k, rng.choice(("advance", "edge_det", "edge_pay", "late", "late")))
         lid = f"RC-{n + 1:03d}"
-        bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": rec.isoformat(), **body})
+        bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": stamp(rec), **body})
 
         def alter(b):
             if "spread" in b:
@@ -561,7 +625,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
         body = {"kind": "FIXING_CORRECTION", "fixing_date": day.isoformat(), "fixing": f"{new // 100}.{new % 100:02d}"}
         rec = booked(k, rng.choice(("edge_det", "edge_pay", "late", "late")))
         lid = f"FX-{n + 1:03d}"
-        bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": rec.isoformat(), **body})
+        bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": stamp(rec), **body})
 
         def alter(b):
             v = max(100, old + rng.choice((-90, -10, 15, 120)))

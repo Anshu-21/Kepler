@@ -2,7 +2,7 @@
 
 Written for the original book: short fixed-rate facilities paid in full every
 month, one booking per rate change, no coverage tests, no withholding and no
-reserve account.  Kept for its output format.
+reserve account, every booking stamped in New York.  Kept for its output format.
 """
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP

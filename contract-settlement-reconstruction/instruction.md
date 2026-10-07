@@ -1,4 +1,4 @@
-`/app/engine.py` settles our multi-tranche loan facilities, but it was written for short fixed-rate deals where every payment date was fully funded. It ignores when rate bookings were made, never trues up interest settled on stale rates, approximates SOFR with an average, only knows three day counts, pays tranches one after another with no deferral, default margin, coverage cure, sweep, withholding gross-up or reserve account, and was never meant for thirty-year books.
+`/app/engine.py` settles our multi-tranche loan facilities, but it was written for short fixed-rate deals where every payment date was fully funded. It ignores when rate bookings were made (and our offices stamp them in their own time zones), never trues up interest settled on stale rates, approximates SOFR with an average and knows nothing of lockouts, only knows three day counts, pays tranches one after another with no deferral, default margin, coverage cure, sweep, withholding gross-up or reserve account, and was never meant for thirty-year books.
 
 Rewrite it so `reconcile(contract)` follows `/app/SETTLEMENT_SPEC.md` exactly, for every period of every tranche, to the cent.
 
