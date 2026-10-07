@@ -10,7 +10,7 @@ difficulty_explanation = """Every dataset was produced by a real PostgreSQL 16.1
 
 This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive. They must answer "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after two point-in-time restores forked the cluster. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow. Here none is installed, and the agent builds that reader from the PostgreSQL sources shipped in the environment.
 
-The code itself is moderate: a WAL record reader, heap redo on a page model, commit tracking, MVCC visibility, a catalog reader and value output for a dozen common types. The reference is about 1,100 lines of Python. The difficulty is that the history contains several situations where the obvious implementation is wrong and nothing on the box says so:
+The code itself is moderate: a WAL record reader, heap redo on a page model, commit tracking, MVCC visibility, a catalog reader and value output for a dozen common types. The reference is about 1,250 lines of Python. The difficulty is that the history contains several situations where the obvious implementation is wrong and nothing on the box says so:
 - Timeline 3 branches from timeline 1, after the point where timeline 2 branched. A reader that chains timelines in numeric order, or that assumes the newest history file extends the previous one, replays the wrong WAL.
 - A VACUUM FULL and an ALTER COLUMN TYPE move two tables to new files, and new partitions are created after the backup. Those relations are not in the backup at all and must be picked up from initialised pages and page images in the WAL. Some of those images arrive as XLOG_FPI records with no main data, which a header parser that waits for a main-data marker misreads.
 - The catalog must be read as of the instant, because the answer depends on it:
@@ -21,6 +21,7 @@ The code itself is moderate: a WAL record reader, heap redo on a page model, com
   - a column is dropped and re-added on the partitioned table, and fast defaults live in each partition's attmissingval.
 - Visibility needs the details right: subtransactions, COMMIT PREPARED (whose committed xid is the prepared transaction's), multixacts from WAL records or from the backed-up pg_multixact, lock-only xmax, frozen tuples, and xids that wrap past 2^32 in four of the five sealed datasets.
 - Point-in-time semantics: replaying to the end and filtering by commit time loses the versions VACUUM removed.
+- Values must be byte-exact text output. float8 is printed by the shortest-decimal routine in src/common/d2s.c as PostgreSQL builds it, without STRICTLY_SHORTEST. For values whose shortest candidate sits exactly on a rounding boundary it prints a longer form, so Python's repr is wrong for a few values in every dataset. interval output follows EncodeInterval's postgres style, where a positive field after a negative one gets a "+" sign.
 
 The staging dataset has live answers for orders and shipments only, at two early instants: before either restore, before the rewrites, the partition changes and the enum rename. So most of the history has to be gotten right by reasoning from the sources rather than by comparing with known answers. A PostgreSQL internals expert who knows these pitfalls would need most of a working day; finding them without being told is the hard part."""
 solution_explanation = """Read the archive. List the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs; a history file lists only the timeline's real ancestors. Decide which timeline answers an instant: a timeline is live from its first commit record after its branch point, and timeline 1 before any of those. Then replay that timeline's path from the backup.
@@ -41,10 +42,10 @@ Read pg_class (through pg_filenode.map for mapped catalogs), pg_namespace, pg_ty
 Then decode each tuple:
 - walk dropped columns too, and honour the null bitmap and the varlena alignment rule;
 - use attmissingval for attributes past the tuple's natts, and detoast through the TOAST relation;
-- render values in the server's text format, with domains through their base type and enums through pg_enum."""
+- render values in the server's text format: domains through their base type, enums through pg_enum, interval with EncodeInterval's postgres style, and float8 with a port of d2s.c's d2d() (built without STRICTLY_SHORTEST)."""
 verification_explanation = """Each of the five sealed datasets was produced by tests/generator/make_dataset.py with PostgreSQL 16.15. The script works as follows:
 - It builds a cluster with 1 MB segments and WAL archiving. In most seeds (four of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
-- It loads the schema: orders, order_items and a two-level partitioned shipments table, a separately built legacy table with its own column order and a dropped column, a table in the archive schema built like shipments, an enum and a domain. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
+- It loads the schema: orders, order_items and a two-level partitioned shipments table, a separately built legacy table with its own column order and a dropped column, a table in the archive schema built like shipments, an enum, a domain, and interval and float8 columns. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
 - It takes a pg_basebackup while sessions keep writing.
 - It then runs a seeded workload of three to five interleaved sessions:
   - inserts, upserts and COPY;
@@ -66,13 +67,15 @@ Throughout, the script captured the live result of SELECT * of the three tables,
 
 The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR`, in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
 
-Measured with 2 CPUs: the reference scores 1 and answers a dataset's 78 to 81 queries in 8 to 11 seconds. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
+Measured with 2 CPUs: the reference scores 1 and answers a dataset's 75 to 81 queries in 7 to 10 seconds. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
 - following only the relations present in the backup;
 - mapping a partition's columns by position;
 - keeping partitions that were detached;
 - only following partitions in the parent's schema;
 - reading enum labels from any version of pg_enum rather than the one visible at the instant;
 - treating timeline 3 as a child of timeline 2;
+- printing float8 with Python's shortest repr;
+- leaving out the "+" that follows a negative interval field;
 - not resolving the domain to its base type;
 - returning NULL for a partition's fast-default column;
 - replaying to the end and filtering by commit time."""

@@ -4,7 +4,7 @@ Usage (as root, PostgreSQL 16 installed, server runs as user `claude`):
     python3 make_dataset.py SEED OUT_DIR SOCKET_DIR PGDATA
 
 Builds a cluster with 1 MB WAL segments and WAL archiving, loads an order schema (two plain
-tables and a partitioned one, an enum and a domain), takes a base backup while the workload keeps
+tables and a partitioned one, an enum, a domain, intervals and floats), takes a base backup while the workload keeps
 running, then runs a seeded multi-session workload (DDL, partition attach/detach/create, table
 rewrites, enum renames, upserts, COPY, locks that become multixacts, savepoints, two-phase
 commits, checkpoints, VACUUM, a changing wal_compression), two point-in-time restores (timeline 2 from timeline 1, then
@@ -162,7 +162,9 @@ CREATE TABLE order_items (
   unit_price numeric(10,2) NOT NULL,
   discount numeric,
   note text,
-  weight weight_kg
+  lead_time interval,
+  weight weight_kg,
+  ratio float8
 );
 CREATE TABLE shipments (
   ship_id bigint NOT NULL,
@@ -238,7 +240,37 @@ def discount():
     return f"{rng.uniform(0, 500):.{rng.randint(1, 6)}f}"
 
 
-# ---------------------------------------------------------------- domain values
+# ---------------------------------------------------------------- interval, float8 and domain values
+
+def interval_value():
+    r = rng.random()
+    if r < 0.15:
+        return None
+    if r < 0.45:
+        return rng.choice(["1 day", "00:00:00", "-00:00:00.5", "36 hours", "1.5 days", "2 weeks", "P1Y2M3DT4H5M6S",
+                           "-1 year 2 mons -3 days +04:05:06.789", "1 mon -1 day", "-2 mons", "1 year", "3 years 1 mon",
+                           "-1 days -02:00:00", "5 days 23:59:59.999999", "100 years", "0.25 seconds", "-7 days 01:00"])
+    parts = []
+    for unit, lo, hi in (("years", -3, 3), ("mons", -14, 14), ("days", -40, 40)):
+        if rng.random() < 0.4:
+            parts.append(f"{rng.randint(lo, hi)} {unit}")
+    if rng.random() < 0.6:
+        sign = "-" if rng.random() < 0.3 else ""
+        frac = "" if rng.random() < 0.5 else "." + str(rng.randint(0, 999999)).zfill(6)
+        parts.append(f"{sign}{rng.randint(0, 50)}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}{frac}")
+    return " ".join(parts) or "0"
+
+
+def float_value():
+    r = rng.random()
+    if r < 0.12:
+        return None
+    if r < 0.25:
+        return rng.choice([0.0, -0.0, 1.0, 0.1, 1e15, 1e16, 123456789012345.6, 1e-4, 1e-5, 1.5e-7, -2.5e300,
+                           5e-324, 1.7976931348623157e308, 100.0, 1e14, 0.30000000000000004, float("nan"),
+                           float("inf"), float("-inf"), 2.0 ** 60, 1 / 3])
+    return rng.uniform(-1, 1) * 10 ** rng.randint(-9, 20)
+
 
 def weight_value():
     if rng.random() < 0.15:
@@ -276,7 +308,7 @@ def order_values(oid):
 
 order_cols = ["order_id", "customer", "status", "total", "placed_at", "ship_by", "priority", "gift", "legacy_code",
               "notes", "manifest"]
-item_cols = ["item_id", "order_id", "sku", "qty", "unit_price", "discount", "note", "weight"]
+item_cols = ["item_id", "order_id", "sku", "qty", "unit_price", "discount", "note", "lead_time", "weight", "ratio"]
 ship_cols = ["ship_id", "order_id", "carrier", "shipped_on", "cost", "label"]
 next_order = 1000
 next_item = 1
@@ -290,7 +322,7 @@ def item_values(oid):
                 sku=f"SKU-{rng.randint(1, 99999):05d}{rng.choice(['', '-XL', '-blue-ltd'])}",
                 qty=rng.randint(-5, 500), unit_price=money(0, 9999), discount=discount(),
                 note=blob("prose") if rng.random() < 0.02 else (None if rng.random() < 0.6 else text(rng.randint(1, 12))),
-                weight=weight_value(), warehouse=None if rng.random() < 0.4 else rng.randint(1, 40))
+                lead_time=interval_value(), weight=weight_value(), ratio=float_value(), warehouse=None if rng.random() < 0.4 else rng.randint(1, 40))
 
 
 # partition layout as the workload sees it; refreshed from the catalog after DDL and restores
@@ -543,8 +575,8 @@ def step_once(step):
                     k.execute("UPDATE order_items SET qty = qty + %s, discount = %s WHERE order_id = %s",
                               (rng.randint(-3, 9), discount(), oid))
                 else:
-                    k.execute("UPDATE order_items SET weight = %s, note = %s WHERE order_id = %s",
-                              (weight_value(), text(rng.randint(1, 6)), oid))
+                    k.execute("UPDATE order_items SET weight = %s, lead_time = %s, ratio = %s WHERE order_id = %s",
+                              (weight_value(), interval_value(), float_value(), oid))
                 held[oid] = i
         elif r < 0.43 and known:
             oid = rng.choice(known)

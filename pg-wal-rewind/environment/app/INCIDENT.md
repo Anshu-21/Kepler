@@ -12,7 +12,7 @@ The shop database runs on PostgreSQL 16.15. Its setup:
 
 Three tables matter: `public.orders`, `public.order_items` and `public.shipments`. `shipments` is partitioned by range on `shipped_on`, and one of its partitions is itself partitioned by list on `carrier`. Since the backup, their history has been messy:
 
-* Columns were added and dropped, some with defaults. One column has an enum type whose values were later renamed and extended. Another has a domain type.
+* Columns were added and dropped, some with defaults. One column has an enum type whose values were later renamed and extended. Another has a domain type, and there are `interval` and `float8` columns.
 * Rows were upserted, copied in with `COPY`, locked, updated, moved between partitions, and deleted.
 * Partitions were created, attached and detached. Tables that had been built separately were attached as partitions; one of them has its own column order.
 * `orders` and `order_items` were each rewritten once, by `VACUUM FULL` and by `ALTER TABLE ... ALTER COLUMN ... TYPE`.
@@ -57,7 +57,7 @@ python3 rewind.py DATA_DIR < queries.json
 * The primary at an instant is whichever server was live then. Timeline 1 was live until the first commit on timeline 2. Timeline 2 was then live until the first commit on timeline 3, and timeline 3 from then on.
 * Every instant asked about is after the base backup completed. No transaction commits exactly at an asked instant.
 
-Each value is the column's text output in a session with `TimeZone = 'UTC'` and `DateStyle = 'ISO'`, i.e. `value::text`. SQL NULL is `null`.
+Each value is the column's text output in a session with `TimeZone = 'UTC'`, `DateStyle = 'ISO'`, `IntervalStyle = 'postgres'` and `extra_float_digits = 1`, i.e. `value::text`. SQL NULL is `null`.
 
 | type | example |
 | --- | --- |
@@ -65,8 +65,10 @@ Each value is the column's text output in a session with `TimeZone = 'UTC'` and 
 | `bool` | `"true"`, `"false"` |
 | `text`, `varchar` | the string itself |
 | `numeric` | `"1250.50"`, `"-0.000120"`, `"NaN"` (always the stored display scale, never an exponent) |
+| `float8` | `"0.1"`, `"1e+15"`, `"-2.5e-07"`, `"NaN"`, `"-Infinity"` |
 | `timestamptz` | `"2026-03-04 05:06:07.25+00"`, `"2026-03-04 05:06:07+00"` |
 | `date` | `"2026-03-04"` |
+| `interval` | `"-1 years -2 mons +3 days -04:05:06.789"`, `"36:00:00"` |
 | `uuid` | `"0c9e3c6a-7d1f-4f3a-9b52-1e0d6c2a8f44"` |
 | enums | the label |
 | domains | the text of the underlying type |

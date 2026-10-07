@@ -883,6 +883,128 @@ def timestamp_text(us):
     return s + "+00"
 
 
+def tdiv(a, b):
+    """C integer division (truncates toward zero)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def interval_text(raw):
+    """interval_out with IntervalStyle = postgres."""
+    time, day, month = struct.unpack_from("<qii", raw, 0)
+    year, mon = tdiv(month, 12), month - 12 * tdiv(month, 12)
+    hour = tdiv(time, 3600000000)
+    time -= hour * 3600000000
+    minute = tdiv(time, 60000000)
+    time -= minute * 60000000
+    sec = tdiv(time, 1000000)
+    fsec = time - sec * 1000000
+    out = ""
+    is_zero, is_before = True, False
+    for value, unit in ((year, "year"), (mon, "mon"), (day, "day")):
+        if value == 0:
+            continue
+        out += ("" if is_zero else " ") + ("+" if is_before and value > 0 else "") + f"{value} {unit}" + \
+            ("s" if value != 1 else "")
+        is_before, is_zero = value < 0, False
+    if is_zero or hour or minute or sec or fsec:
+        minus = hour < 0 or minute < 0 or sec < 0 or fsec < 0
+        out += ("" if is_zero else " ") + ("-" if minus else "+" if is_before else "") + \
+            "%02d:%02d:%02d" % (abs(hour), abs(minute), abs(sec))
+        if fsec:
+            out += ("." + "%06d" % abs(fsec)).rstrip("0")
+    return out
+
+
+def _pow5_factor(v):
+    n = 0
+    while v and v % 5 == 0:
+        v //= 5
+        n += 1
+    return n
+
+
+def _d2d(mant, exp2):
+    """PostgreSQL's d2d() (Ryu, built without STRICTLY_SHORTEST) with exact integer arithmetic."""
+    if exp2 == 0:
+        e2, m2 = 1 - 1023 - 52 - 2, mant
+    else:
+        e2, m2 = exp2 - 1023 - 52 - 2, (1 << 52) | mant
+    mv = 4 * m2
+    mm_shift = 1 if mant != 0 or exp2 <= 1 else 0
+    mp, mm = mv + 2, mv - 1 - mm_shift
+    vr_tz = False
+    if e2 >= 0:
+        q = ((e2 * 78913) >> 18) - (e2 > 3)
+        e10 = q
+        den = 10 ** q
+        vr, vp, vm = (mv << e2) // den, (mp << e2) // den, (mm << e2) // den
+        if q <= 21:
+            if mv % 5 == 0:
+                vr_tz = _pow5_factor(mv) >= q
+            else:
+                vp -= _pow5_factor(mv + 2) >= q
+    else:
+        q = ((-e2 * 732923) >> 20) - (-e2 > 1)
+        i = -e2 - q
+        e10 = q + e2
+        f = 5 ** i
+        vr, vp, vm = (mv * f) >> q, (mp * f) >> q, (mm * f) >> q
+        if q <= 1:
+            vr_tz = True
+            vp -= 1
+        elif q < 63:
+            vr_tz = mv & ((1 << (q - 1)) - 1) == 0
+    removed = 0
+    if vr_tz:
+        last = 0
+        while vp // 10 > vm // 10:
+            vr_tz &= last == 0
+            last = vr % 10
+            vr, vp, vm = vr // 10, vp // 10, vm // 10
+            removed += 1
+        if vr_tz and last == 5 and vr % 2 == 0:
+            last = 4
+        output = vr + (vr == vm or last >= 5)
+    else:
+        round_up = False
+        while vp // 10 > vm // 10:
+            round_up = vr % 10 >= 5
+            vr, vp, vm = vr // 10, vp // 10, vm // 10
+            removed += 1
+        output = vr + (vr == vm or round_up)
+    return output, e10 + removed
+
+
+def float8_text(raw):
+    """float8out with extra_float_digits > 0: double_to_shortest_decimal() of src/common/d2s.c."""
+    bits = struct.unpack("<Q", raw[:8])[0]
+    sign = "-" if bits >> 63 else ""
+    exp2, mant = (bits >> 52) & 0x7FF, bits & ((1 << 52) - 1)
+    if exp2 == 0x7FF:
+        return "NaN" if mant else sign + "Infinity"
+    if exp2 == 0 and mant == 0:
+        return sign + "0"
+    e2 = exp2 - 1023 - 52
+    if -52 <= e2 <= 0 and mant & ((1 << -e2) - 1) == 0:  # d2d_small_int
+        output, e10 = ((1 << 52) | mant) >> -e2, 0
+    else:
+        output, e10 = _d2d(mant, exp2)
+    digits = str(output)
+    exp = e10 + len(digits) - 1
+    if -4 <= exp < 15:
+        if e10 >= 0:
+            return sign + digits + "0" * e10
+        point = len(digits) + e10
+        if point > 0:
+            return sign + digits[:point] + "." + digits[point:]
+        return sign + "0." + "0" * -point + digits
+    if e10 == 0:
+        digits = digits.rstrip("0")
+    body = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+    return sign + body + "e" + ("-" if exp < 0 else "+") + "%02d" % abs(exp)
+
+
 class Types:
     """pg_type and pg_enum as of the snapshot."""
 
@@ -954,6 +1076,10 @@ def render(oid, raw):
         return timestamp_text(struct.unpack("<q", raw[:8])[0])
     if oid == 1082:
         return (EPOCH + timedelta(days=struct.unpack("<i", raw[:4])[0])).strftime("%Y-%m-%d")
+    if oid == 1186:
+        return interval_text(raw)
+    if oid == 701:
+        return float8_text(raw)
     if oid == 2950:
         h = raw[:16].hex()
         return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
