@@ -41,7 +41,7 @@ def sandbox():
 
 
 def row_hash(row):
-    return hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:12]
 
 
 def run_dataset(name, queries):
