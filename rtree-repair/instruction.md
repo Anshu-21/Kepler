@@ -38,6 +38,9 @@ The tree must provide:
 * `queryRect(rect)`
 * `hitTest(x, y)`
 * `queryTop(rect, k)`
+* `nearest(x, y, k)`
+* `removeRect(rect)`
+* `diff(a, b)`
 * `size` getter
 * `resetStats()`
 
@@ -50,6 +53,12 @@ The tree must provide:
 `queryRect(rect)` returns fresh copies of all shapes whose boxes intersect the supplied rectangle. Results must be sorted by ID.
 
 `queryTop(rect, k)` takes an integer `k >= 1` and returns fresh copies of the `k` best shapes among those that intersect `rect`, or fewer if fewer intersect. Best means highest `z`, and the smaller ID among equal `z`; the result is ordered best first.
+
+`nearest(x, y, k)` returns fresh copies of the `k` shapes closest to the point, nearest first, or all of them if there are fewer. The distance is the Euclidean distance from the point to the closed box, which is 0 when the point is inside the box or on its edge. Equal distances are ordered by smaller ID. The tests use integer coordinates below `1e6` for `nearest`, so squared distances are exact.
+
+`removeRect(rect)` removes every shape that lies entirely inside `rect` and returns how many it removed. Containment is closed: `rect.minX <= s.minX`, `s.maxX <= rect.maxX`, and the same for Y. A zero-area shape lying exactly on the far edge of `rect` is therefore removed even though it does not intersect `rect` in the half-open sense. The tree has to satisfy every structural rule afterwards.
+
+`diff(a, b)` takes two versions of this tree, each either a snapshot taken from it or the tree itself, and returns an array of `{ id, before, after }` for every ID whose shape exists in only one version or differs in bounds or `z`. The array is sorted by ID, `before` is a fresh copy of the shape in `a` (or `null`) and `after` is the same for `b`. The two versions may lie on different branches of the history, for example one taken before a `restore` and one after it.
 
 `hitTest(x, y)` returns a fresh copy of the shape containing the point with the highest `z`. If multiple shapes have the same `z`, the smaller ID wins. Return `null` when no shape contains the point.
 
@@ -129,6 +138,8 @@ No later `insert`, `remove`, `update` or `restore` on the tree may change anythi
 
 `restore(view)` makes the tree equal to a snapshot taken from it earlier (it may take time proportional to the number of shapes). The tree can then be changed again, and neither that snapshot nor any other may be affected. The snapshot can be restored again later.
 
+Every node's `children` must remain an ordinary writable data property, because the graders wrap it to count how often the children of a node are read.
+
 Statistics:
 
 `tree.stats` must contain:
@@ -148,7 +159,7 @@ For a 50,000-shape scene, a query covering a small area should stay within:
 nodeVisits + entryChecks <= 400
 ```
 
-This must still hold after tens of thousands of moves and deletions, and also when the shapes were inserted in sweep order (all of one axis in increasing order) instead of at random. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`, and `queryTop` with a 100 by 100 rectangle and `k = 3` within 600. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
+This must still hold after tens of thousands of moves and deletions, and also when the shapes were inserted in sweep order (all of one axis in increasing order) instead of at random. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`, and `queryTop` with a 100 by 100 rectangle and `k = 3` within 600. In a 50,000-shape scene, `nearest` with `k = 5` may read the children of at most 250 nodes. `removeRect` may read the children of at most `6 * n + 250` nodes when it removes `n` shapes. `diff` may read the children of at most `40 * c + 600` nodes when it returns `c` entries. The graders count these reads themselves, so a scan of the scene is rejected whatever `stats` says. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
 
 Cases to handle:
 
@@ -163,6 +174,8 @@ Do not assume the input is random. The tests include cases such as:
 * zero-area shapes
 * coordinates of wildly different magnitude in one scene (`1e-300` next to `1e300`, `Number.MIN_VALUE`, `-0`)
 * shapes inserted in sorted order
+* bulk removal that empties whole subtrees, leaves other nodes underfull, and removes zero-area shapes that sit on the rectangle's edge
+* diffs between versions on different branches, and between a snapshot and the live tree
 * snapshots taken after every single operation, then compared with the scene as it was, and undo to an old version followed by new edits
 * many shapes with the same `z`, and `z` changes on shapes that are the current `top` of their ancestors
 

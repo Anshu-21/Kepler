@@ -14,6 +14,9 @@ const MIN = 4;
 const NEW_PER_OP = Number(process.env.RT_NEW_PER_OP || 40);
 const TOP_BUDGET = Number(process.env.RT_TOP_BUDGET || 600);
 const SORT_BUDGET = Number(process.env.RT_SORT_BUDGET || 400);
+const NN_BUDGET = Number(process.env.RT_NN_BUDGET || 250);
+const RR_FACTOR = Number(process.env.RT_RR_FACTOR || 6);
+const RR_BASE = Number(process.env.RT_RR_BASE || 250);
 const RECT_BUDGET = Number(process.env.RT_RECT_BUDGET || 400);
 const HIT_BUDGET = Number(process.env.RT_HIT_BUDGET || 500);
 
@@ -68,6 +71,12 @@ class Gen {
   h(x, y) { this.ops.push(['h', x, y]); }
   S() { this.ops.push(['S']); }
   qt(r, k) { this.ops.push(['qt', r, k]); }
+  rr(rect, budget) {
+    this.ops.push(['rr', rect].concat(budget || []));
+    for (const o of [...this.ref.m.values()]) if (rect.minX <= o.minX && o.maxX <= rect.maxX && rect.minY <= o.minY && o.maxY <= rect.maxY) this.ref.remove(o.id);
+  }
+  nn(x, y, k, budget) { this.ops.push(['nn', x, y, k, budget]); }
+  diff(a, b, strict) { this.ops.push(['diff', a, b, strict]); }
   snap(name) { this.ops.push(['snap', name]); this.snaps = this.snaps || {}; const c = new Ref(); for (const [k, v] of this.ref.m) c.m.set(k, v); this.snaps[name] = c; }
   restore(name) { this.ops.push(['restore', name]); const c = new Ref(); for (const [k, v] of this.snaps[name].m) c.m.set(k, v); this.ref = c; }
   SV(name) { this.ops.push(['SV', name]); }
@@ -443,6 +452,118 @@ SC.extreme = () => {
   return g.ops;
 };
 
+SC.removerect = () => {
+  const rand = rng(1212);
+  const g = new Gen();
+  const W = 2000, H = 2000;
+  const mk = (id) => ({ id, ...box(Math.floor(rand() * W), Math.floor(rand() * H), Math.floor(rand() * 40), Math.floor(rand() * 40)), z: Math.floor(rand() * 6) });
+  for (let i = 0; i < 2500; i++) g.ins(mk(`r${i}`));
+  // zero-area shapes exactly on the edges of a rectangle that will be removed
+  for (let i = 0; i < 30; i++) g.ins({ id: `edge${i}`, minX: 1000, maxX: 1000, minY: 100 + i * 10, maxY: 100 + i * 10, z: 1 });
+  g.check(rand, W, H, 10, 10, 30);
+  g.snap('before');
+  g.rr({ minX: 900, minY: 90, maxX: 1000, maxY: 400 });
+  g.S(); g.probes(rand, W, H, 20, 20, 30);
+  g.snap('after-edge');
+  for (let step = 0; step < 90; step++) {
+    const r = rand();
+    const x = Math.floor(rand() * W), y = Math.floor(rand() * H);
+    const sz = r < 0.5 ? 60 : r < 0.85 ? 300 : 900;
+    g.rr({ minX: x, minY: y, maxX: x + sz, maxY: y + sz });
+    for (let k = 0; k < 6; k++) g.ins(mk(`n${step}_${k}`));
+    for (let k = 0; k < 4; k++) { const ids = [...g.ref.m.keys()]; if (ids.length) g.upd(ids[Math.floor(rand() * ids.length)], box(Math.floor(rand() * W), Math.floor(rand() * H), 30, 30)); }
+    if (step % 3 === 0) g.check(rand, W, H, 6, 6, 30);
+    if (step === 40) g.snap('mid');
+  }
+  g.rr({ minX: 0, minY: 0, maxX: 2500, maxY: 1200 }); g.S();
+  g.rr({ minX: 5, minY: 5, maxX: 5, maxY: 5 }); g.rr({ minX: -9, minY: -9, maxX: -1, maxY: -1 });
+  g.restore('before'); g.S(); g.probes(rand, W, H, 20, 20, 30);
+  g.rr({ minX: -1e9, minY: -1e9, maxX: 1e9, maxY: 1e9 });
+  g.S(); g.q({ minX: -1e9, minY: -1e9, maxX: 1e9, maxY: 1e9 }); g.h(5, 5);
+  for (const n of ['before', 'after-edge', 'mid']) { g.SV(n); g.probesV(rand, n, W, H, 8, 8, 30); }
+  g.restore('mid'); g.S();
+  for (let k = 0; k < 40; k++) g.ins(mk(`late${k}`));
+  g.S();
+  return g.ops;
+};
+
+SC.nearest = () => {
+  const rand = rng(2323);
+  const g = new Gen();
+  const W = 3000, H = 3000;
+  const mk = (id) => ({ id, ...box(Math.floor(rand() * W), Math.floor(rand() * H), rand() < 0.2 ? 0 : Math.floor(rand() * 30), rand() < 0.2 ? 0 : Math.floor(rand() * 30)), z: Math.floor(rand() * 5) });
+  for (let i = 0; i < 2500; i++) g.ins(mk(i % 7 === 0 ? `Q${i}` : `q${i}`));
+  const probe = () => { for (let i = 0; i < 25; i++) g.nn(Math.floor(rand() * W), Math.floor(rand() * H), 1 + Math.floor(rand() * 10)); const list = [...g.ref.m.values()]; for (let i = 0; i < 10; i++) { const o = list[Math.floor(rand() * list.length)]; g.nn(o.minX, o.minY, 4); g.nn(o.maxX, o.maxY, 3); } };
+  g.S(); probe();
+  g.nn(-500, -500, 5); g.nn(1500, 1500, 100000); g.nn(0, 0, 1);
+  for (let step = 0; step < 1500; step++) {
+    const ids = [...g.ref.m.keys()];
+    const id = ids[Math.floor(rand() * ids.length)];
+    const r = rand();
+    if (r < 0.3) g.rm(id); else if (r < 0.65) g.upd(id, box(Math.floor(rand() * W), Math.floor(rand() * H), Math.floor(rand() * 30), Math.floor(rand() * 30))); else g.ins(mk(`m${step}`));
+    if (step % 60 === 0) { g.S(); probe(); }
+  }
+  g.snap('s');
+  for (let i = 0; i < 100; i++) g.rm([...g.ref.m.keys()][0]);
+  for (let i = 0; i < 20; i++) g.ops.push(['nnv', 's', Math.floor(rand() * W), Math.floor(rand() * H), 1 + Math.floor(rand() * 6)]);
+  return g.ops;
+};
+
+SC.versions = () => {
+  // branching history: edits, snapshots, restores, more edits; diff between any two versions
+  const rand = rng(3434);
+  const g = new Gen();
+  const W = 3000, H = 3000;
+  const mk = (id) => ({ id, ...box(rand() * W, rand() * H, 3 + rand() * 40, 3 + rand() * 40), z: Math.floor(rand() * 6) });
+  const edits = (n, tag) => {
+    for (let i = 0; i < n; i++) {
+      const ids = [...g.ref.m.keys()];
+      const r = rand();
+      if (r < 0.25 && ids.length > 50) g.rm(ids[Math.floor(rand() * ids.length)]);
+      else if (r < 0.6) g.upd(ids[Math.floor(rand() * ids.length)], { ...box(rand() * W, rand() * H, 3 + rand() * 40, 3 + rand() * 40), z: Math.floor(rand() * 6) });
+      else if (r < 0.7) { const id = ids[Math.floor(rand() * ids.length)]; const o = g.ref.m.get(id); g.upd(id, { minX: o.minX, minY: o.minY, maxX: o.maxX, maxY: o.maxY, z: o.z + 1 }); }
+      else if (r < 0.75) { const x = rand() * W, y = rand() * H; g.rr({ minX: x, minY: y, maxX: x + 120, maxY: y + 120 }); }
+      else g.ins(mk(`${tag}${i}`));
+    }
+  };
+  for (let i = 0; i < 1500; i++) g.ins(mk(`b${i}`));
+  g.snap('base');
+  edits(60, 'a'); g.snap('A1'); edits(40, 'aa'); g.snap('A2');
+  g.restore('base'); edits(50, 'c'); g.snap('B1');
+  g.restore('A1'); edits(30, 'd'); g.snap('C1');
+  g.restore('base'); g.snap('base2');
+  const names = ['base', 'A1', 'A2', 'B1', 'C1', 'base2'];
+  for (const a of names) for (const b of names) g.diff(a, b);
+  g.diff('A2', '@'); g.diff('@', 'B1'); g.diff('@', '@');
+  edits(25, 'e');
+  g.diff('base', '@'); g.diff('C1', '@'); g.diff('@', 'A2');
+  g.S();
+  return g.ops;
+};
+
+SC.perf_ops = () => {
+  // large scene: nearest, bulk removal and version diff must all be proportional to what they touch
+  const rand = rng(4545);
+  const g = new Gen();
+  const mk = (id) => ({ id, ...box(Math.floor(rand() * 20000), Math.floor(rand() * 20000), 1 + Math.floor(rand() * 40), 1 + Math.floor(rand() * 40)), z: Math.floor(rand() * 8) });
+  for (let i = 0; i < 50000; i++) g.ins(mk(`p${i}`));
+  g.S();
+  for (let i = 0; i < 150; i++) g.nn(Math.floor(rand() * 20000), Math.floor(rand() * 20000), 5, NN_BUDGET);
+  g.snap('v0');
+  for (let i = 0; i < 40; i++) { const ids = [...g.ref.m.keys()]; g.upd(ids[Math.floor(rand() * ids.length)], box(rand() * 20000, rand() * 20000, 30, 30)); }
+  g.snap('v1');
+  g.diff('v0', 'v1', true); g.diff('v1', 'v0', true);
+  g.restore('v0');
+  for (let i = 0; i < 25; i++) g.ins(mk(`new${i}`));
+  g.snap('v2');
+  g.diff('v1', 'v2', true); g.diff('v2', '@', true);
+  for (let i = 0; i < 12; i++) { const x = Math.floor(rand() * 19000), y = Math.floor(rand() * 19000); g.rr({ minX: x, minY: y, maxX: x + 600, maxY: y + 600 }, [RR_FACTOR, RR_BASE]); }
+  g.S();
+  g.diff('v2', '@', true);
+  g.rr({ minX: 3, minY: 3, maxX: 4, maxY: 4 }, [RR_FACTOR, RR_BASE]);
+  return g.ops;
+};
+
 SC.tamper = () => {
   const rand = rng(3);
   const g = new Gen();
@@ -693,6 +814,47 @@ function judge(ops, res) {
         if (exp) assert(rowKey(r.v) === key(exp), `${at}: hitTest(${op[1]},${op[2]}) returned ${r.v}, expected ${key(exp)}`);
         break;
       }
+      case 'rr': {
+        const hit = [...ref.m.values()].filter((o) => op[1].minX <= o.minX && o.maxX <= op[1].maxX && op[1].minY <= o.minY && o.maxY <= op[1].maxY);
+        assert(r.n === hit.length, `${at}: removeRect returned ${r.n}, expected ${hit.length}`);
+        for (const o of hit) ref.remove(o.id);
+        if (process.env.RT_REPORT) console.error(`rr n=${hit.length} rep=${r.rep}`);
+        if (op[2]) assert(r.reads <= op[2] * hit.length + op[3], `${at}: removeRect of ${hit.length} shapes read the children of ${r.reads} nodes (limit ${op[2] * hit.length + op[3]})`);
+        if (op[2]) assert(r.rep <= op[2] * hit.length + op[3], `${at}: removeRect of ${hit.length} shapes inspected ${r.rep} nodes and shapes (limit ${op[2] * hit.length + op[3]})`);
+        break;
+      }
+      case 'nn': case 'nnv': {
+        const src = op[0] === 'nn' ? ref : snaps[op[1]];
+        const [x, y, k] = op[0] === 'nn' ? [op[1], op[2], op[3]] : [op[2], op[3], op[4]];
+        const d2 = (o) => { const dx = Math.max(o.minX - x, 0, x - o.maxX), dy = Math.max(o.minY - y, 0, y - o.maxY); return dx * dx + dy * dy; };
+        const exp = [...src.m.values()].sort((a, b) => d2(a) - d2(b) || cmpId(a.id, b.id)).slice(0, k);
+        listMatches(r.list, exp, `${at}: nearest(${x},${y},${k})`);
+        if (process.env.RT_REPORT && op[0] === 'nn' && op[4]) console.error(`nn rep=${r.rep}`);
+        if (op[0] === 'nn' && op[4]) assert(r.reads <= op[4], `${at}: nearest read the children of ${r.reads} nodes (budget ${op[4]})`);
+        if (op[0] === 'nn' && op[4]) assert(r.rep <= op[4], `${at}: nearest inspected ${r.rep} nodes and shapes (budget ${op[4]})`);
+        break;
+      }
+      case 'diff': {
+        const A = op[1] === '@' ? ref : snaps[op[1]];
+        const Bv = op[2] === '@' ? ref : snaps[op[2]];
+        const exp = [];
+        for (const id of new Set([...A.m.keys(), ...Bv.m.keys()])) {
+          const a = A.m.get(id) || null, b = Bv.m.get(id) || null;
+          if (!(a && b && key(a) === key(b))) exp.push([id, a, b]);
+        }
+        exp.sort((p, q) => cmpId(p[0], q[0]));
+        assert(Array.isArray(r.list), `${at}: diff did not return an array`);
+        assert(r.list.length === exp.length, `${at}: diff(${op[1]},${op[2]}) returned ${r.list.length} changes, expected ${exp.length}`);
+        for (let k = 0; k < exp.length; k++) {
+          const g = r.list[k];
+          assert(g[0] === exp[k][0], `${at}: diff entry ${k} is ${g[0]}, expected ${exp[k][0]}`);
+          assert((g[1] === null) === (exp[k][1] === null) && (!g[1] || rowKey(g[1]) === key(exp[k][1])), `${at}: diff before of ${exp[k][0]} is wrong`);
+          assert((g[2] === null) === (exp[k][2] === null) && (!g[2] || rowKey(g[2]) === key(exp[k][2])), `${at}: diff after of ${exp[k][0]} is wrong`);
+        }
+        if (process.env.RT_REPORT && op[3]) console.error(`diff changes=${exp.length} reads=${r.reads}`);
+        if (op[3]) assert(r.reads <= 40 * exp.length + 600, `${at}: diff of ${exp.length} changes read the children of ${r.reads} nodes (limit ${40 * exp.length + 600}); it must not scan the scene`);
+        break;
+      }
       case 'qt': listMatches(r.list, expTop(ref, op[1], op[2]), `${at}: queryTop ${JSON.stringify(op[1])} k=${op[2]}`); break;
       case 'qtv': listMatches(r.list, expTop(snaps[op[1]], op[2], op[3]), `${at}: queryTop on snapshot ${op[1]}`); break;
       case 'S': checkStructure(r.dump, r.size, ref); break;
@@ -705,8 +867,10 @@ function judge(ops, res) {
       case 'B': {
         assert(!r.trap, `${at}: a query iterated over the whole scene`);
         checkStructure(r.dump, r.size, ref);
+        const rep = { rect: 0, hit: 0, top: 0 };
         for (let k = 0; k < op[1].length; k++) {
           const it = r.items[k];
+          rep.rect += simulateRect(r.dump, op[1][k]) / op[1].length;
           listMatches(it.list, ref.query(op[1][k]), `${at}: localized queryRect`);
           const rb = op[6] || RECT_BUDGET;
           assert(it.rep <= rb, `${at}: queryRect reported ${it.rep} inspections (budget ${rb})`);
@@ -719,6 +883,7 @@ function judge(ops, res) {
           const hv = r.hits[k].v;
           assert((hv === null) === (exp === null) && (!exp || rowKey(hv) === key(exp)), `${at}: hitTest(${x},${y}) mismatch`);
           assert(r.hits[k].rep <= HIT_BUDGET, `${at}: hitTest reported ${r.hits[k].rep} inspections (budget ${HIT_BUDGET})`);
+          rep.hit += simulateHit(r.dump, x, y) / op[2].length;
           const sim = simulateHit(r.dump, x, y);
           assert(sim <= HIT_BUDGET, `${at}: a hit test needs ${sim} inspections on your tree (budget ${HIT_BUDGET}); is node.top used to prune?`);
         }
@@ -727,9 +892,11 @@ function judge(ops, res) {
           const t = r.tops[k];
           listMatches(t.list, expTop(ref, op[3][k], op[4]), `${at}: queryTop`);
           assert(t.rep <= tb, `${at}: queryTop reported ${t.rep} inspections (budget ${tb})`);
+          rep.top += simulateTop(r.dump, op[3][k], op[4]) / op[3].length;
           const sim = simulateTop(r.dump, op[3][k], op[4]);
           assert(sim <= tb, `${at}: queryTop needs ${sim} inspections on your tree (budget ${tb})`);
         }
+        if (process.env.RT_REPORT) console.error(`B@${i}: mean rect ${rep.rect.toFixed(1)} hit ${rep.hit.toFixed(1)} top ${rep.top.toFixed(1)}`);
         break;
       }
       default: throw new Error('bad op');
