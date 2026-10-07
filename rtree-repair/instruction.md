@@ -91,11 +91,12 @@ The internal structure is also part of the contract.
     minY,
     maxX,
     maxY
-  }
+  },
+  top: shape
 }
 ```
 
-An empty root has `bounds === null`.
+An empty root has `bounds === null` and `top === null`.
 
 For a leaf node, `children` contains the actual shape objects.
 
@@ -108,6 +109,8 @@ Every node can have at most `maxEntries` children. Every non-root node must have
 An internal root must have at least two children. A leaf root can contain anywhere from zero to `maxEntries` shapes.
 
 The bounds stored on every node must always be the exact minimum bounding rectangle of its children. Do not leave larger or outdated bounds behind.
+
+Every node's `top` is the shape that `hitTest` would choose if the point were inside every shape below that node: the highest `z`, and the smallest ID among shapes with that `z`. It must be exact at all times, including after a `z` change, a removal of the current top shape, a split or a reinsertion. In a real scene hundreds of large shapes can be stacked over the same point, so `hitTest` is expected to use `top` to avoid looking at shapes that cannot win.
 
 Each live shape must occur exactly once in the tree, using its current bounds and `z`.
 
@@ -132,7 +135,7 @@ For a 50,000-shape scene, a query covering a small area should stay within:
 nodeVisits + entryChecks <= 400
 ```
 
-This must still hold after tens of thousands of moves and deletions. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
+This must still hold after tens of thousands of moves and deletions. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
 
 Cases to handle:
 
@@ -145,6 +148,7 @@ Do not assume the input is random. The tests include cases such as:
 * shapes repeatedly moved between distant parts of the canvas
 * deleting everything and then inserting again
 * zero-area shapes
+* many shapes with the same `z`, and `z` changes on shapes that are the current `top` of their ancestors
 
 After every operation, the tree must give the same results as a brute-force scan of the current live shapes.
 

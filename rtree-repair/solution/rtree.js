@@ -40,11 +40,17 @@ function intersectionArea(a, b) {
   return w > 0 && h > 0 ? w * h : 0;
 }
 
+// a is a strictly better hit than b: higher z, then smaller id
+function better(a, b) {
+  return !b || a.z > b.z || (a.z === b.z && cmpId(a.id, b.id) < 0);
+}
+
 class Node {
   constructor(leaf) {
     this.leaf = leaf;
     this.children = [];
     this.bounds = null;
+    this.top = null; // best shape (highest z, then smallest id) anywhere below this node
   }
 }
 
@@ -63,6 +69,12 @@ function mbr(items) {
 
 function recalc(node) {
   node.bounds = mbr(node.children);
+  let top = null;
+  for (const c of node.children) {
+    const t = c instanceof Node ? c.top : c;
+    if (better(t, top)) top = t;
+  }
+  node.top = top;
 }
 
 function collectEntries(node, out) {
@@ -185,10 +197,15 @@ class RTree {
         this.stats.entryChecks++;
         if (!containsPoint(e, x, y)) continue;
         const b = best.e;
-        if (!b || e.z > b.z || (e.z === b.z && cmpId(e.id, b.id) < 0)) best.e = e;
+        if (better(e, b)) best.e = e;
       }
     } else {
-      for (const c of node.children) if (containsPoint(c.bounds, x, y)) this._hit(c, x, y, best);
+      const cand = node.children.filter((c) => containsPoint(c.bounds, x, y));
+      cand.sort((a, b) => (better(a.top, b.top) ? -1 : 1));
+      for (const c of cand) {
+        if (!better(c.top, best.e)) break;
+        this._hit(c, x, y, best);
+      }
     }
   }
 

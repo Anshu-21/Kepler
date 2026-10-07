@@ -40,11 +40,17 @@ function intersectionArea(a, b) {
   return w > 0 && h > 0 ? w * h : 0;
 }
 
+// a is a strictly better hit than b: higher z, then smaller id
+function better(a, b) {
+  return !b || a.z > b.z;
+}
+
 class Node {
   constructor(leaf) {
     this.leaf = leaf;
     this.children = [];
     this.bounds = null;
+    this.top = null; // best shape (highest z, then smallest id) anywhere below this node
   }
 }
 
@@ -177,7 +183,7 @@ class RTree {
         this.stats.entryChecks++;
         if (!containsPoint(e, x, y)) continue;
         const b = best.e;
-        if (!b || e.z > b.z) best.e = e;
+        if (better(e, b)) best.e = e;
       }
     } else {
       for (const c of node.children) if (containsPoint(c.bounds, x, y)) this._hit(c, x, y, best);
@@ -217,6 +223,7 @@ class RTree {
       path.push(n);
     }
     n.children.push(entry);
+    for (const p of path) if (better(entry, p.top)) p.top = entry;
     for (let i = path.length - 1; i >= 0; i--) {
       const node = path[i];
       recalc(node);
