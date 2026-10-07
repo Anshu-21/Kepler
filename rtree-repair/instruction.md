@@ -1,15 +1,151 @@
-Our diagram editor keeps every shape on the canvas in an R-tree so that hover and marquee selection don't scan the whole scene. The index lives in /app/src/rtree.js and it is broken: after enough inserts, removals and moves it returns wrong objects, loses or duplicates shapes, and its bounding boxes drift out of date so queries wander into branches that have nothing to do with the mouse position. Repair it. You may patch the file or rewrite it, but it has to keep the contract below, because the editor and the graders both reach into the structure. Only /app/src/rtree.js is read back; anything else you create is ignored. It runs on the Node.js that is installed in the image, uses no packages, and must export RTree with module.exports = { RTree }.
+Our diagram editor stores every shape on the canvas in an R-tree. This is used for hover and marquee selection so that the editor does not have to scan every shape on the canvas. The current implementation in `/app/src/rtree.js` is broken. After enough inserts, deletes, and moves, it can return the wrong objects, lose or duplicate shapes, and leave old bounding boxes in the tree. This can also make queries visit completely unrelated branches.
 
-A shape is a plain object with a string id, finite numbers minX, minY, maxX, maxY with minX <= maxX and minY <= maxY, and an optional numeric z that defaults to 0. Zero width or zero height is legal. Ids are compared by UTF-16 code unit order (the < operator on strings), never by locale, so "Zed" sorts before "apple" and "a10" before "a2".
+Fix the R-tree. You can patch the existing implementation or replace it completely, but the public and structural contract below must stay the same. The editor and the graders both inspect the tree directly.
 
-new RTree({ maxEntries }) defaults to maxEntries 9 and the minimum fill is ceil(0.4 * maxEntries). The tree offers insert(shape), remove(id), update(id, bounds), queryRect(rect), hitTest(x, y), a size getter and resetStats(). insert throws on a duplicate id or on invalid bounds. remove returns true if the id existed and false otherwise. update takes new bounds, optionally with a new z, keeps the old z when none is given, and throws for an unknown id or invalid bounds; a call that throws must leave the index unchanged. queryRect returns fresh copies of every shape whose box intersects the rectangle, sorted by id. hitTest returns a fresh copy of the shape containing the point that has the highest z, the smaller id winning a tie, or null if there is none.
+Only `/app/src/rtree.js` will be used for the final check. Anything else you create will be ignored. The code runs on the Node.js version already installed in the image, with no external packages.
 
-Boxes are half-open, [minX, maxX) by [minY, maxY). Box a intersects box b exactly when a.minX < b.maxX and b.minX < a.maxX and a.minY < b.maxY and b.minY < a.maxY, so boxes that merely share an edge do not intersect. A point (x, y) is inside a box when minX <= x < maxX and minY <= y < maxY, so a zero-area shape can never be hit.
+The file must export the tree like this:
 
-The structure is part of the contract. tree.root is a node with a boolean leaf, an array children and a bounds object {minX, minY, maxX, maxY}. The children of a leaf are the stored shapes themselves (objects carrying id, the four bounds and z); the children of any other node are nodes. All leaves are at the same depth. Every node holds at most maxEntries children and every node except the root holds at least the minimum fill. An internal root has at least two children, and a leaf root may hold anything from zero up to maxEntries. The bounds of a node must always be exactly the minimum bounding rectangle of its children, no looser, and an empty root has bounds null. Each shape must appear in the tree exactly once, with its current bounds and z. Every answer must come out of this structure; keeping a second copy of the scene to scan would defeat the point.
+```js
+module.exports = { RTree };
+```
 
-tree.stats holds nodeVisits, incremented each time a node is entered during queryRect or hitTest, and entryChecks, incremented for each shape a query tests; resetStats zeroes both. Queries that cover a small area of a 50,000-shape scene, including after tens of thousands of moves and deletions, must cost at most 400 nodeVisits plus entryChecks each. The graders also count this on your tree independently, so the numbers you report are not what decides it.
+Shapes:
 
-Expect scenes that are far from random: tiles that share edges, tight clusters, diagonals, a few huge shapes with thousands of small ones inside them, shapes that are moved back and forth between distant parts of the canvas, trees emptied completely and refilled, and zero-area shapes. After every kind of operation the index must agree with a brute-force scan of the live scene.
+A shape is a plain object containing:
+
+* `id`: a string
+* `minX`, `minY`, `maxX`, `maxY`: finite numbers
+* `minX <= maxX` and `minY <= maxY`
+* optional numeric `z`, which defaults to `0`
+
+Zero-width and zero-height shapes are valid.
+
+IDs must be compared using normal JavaScript string ordering (`<`). Do not use locale-based sorting. For example, `"Zed"` comes before `"apple"` and `"a10"` comes before `"a2"`.
+
+RTree API:
+
+`new RTree({ maxEntries })` creates the tree.
+
+* Default `maxEntries` is `9`.
+* Minimum fill is `ceil(0.4 * maxEntries)`.
+
+The tree must provide:
+
+* `insert(shape)`
+* `remove(id)`
+* `update(id, bounds)`
+* `queryRect(rect)`
+* `hitTest(x, y)`
+* `size` getter
+* `resetStats()`
+
+`insert` must throw if the ID already exists or the bounds are invalid.
+
+`remove(id)` returns `true` when the shape existed and was removed, otherwise `false`.
+
+`update(id, bounds)` changes the shape's bounds. It may also receive a new `z`; if `z` is not supplied, keep the old value. It must throw if the ID does not exist or the new bounds are invalid. If the operation throws, nothing in the tree may be changed.
+
+`queryRect(rect)` returns fresh copies of all shapes whose boxes intersect the supplied rectangle. Results must be sorted by ID.
+
+`hitTest(x, y)` returns a fresh copy of the shape containing the point with the highest `z`. If multiple shapes have the same `z`, the smaller ID wins. Return `null` when no shape contains the point.
+
+Box rules:
+
+All boxes use half-open ranges:
+
+`[minX, maxX) × [minY, maxY)`
+
+Two boxes intersect only when:
+
+```text
+a.minX < b.maxX
+b.minX < a.maxX
+a.minY < b.maxY
+b.minY < a.maxY
+```
+
+So boxes that only touch along an edge do not intersect.
+
+A point is inside a box when:
+
+```text
+minX <= x < maxX
+minY <= y < maxY
+```
+
+A zero-area shape can therefore never be returned by `hitTest`.
+
+Tree structure:
+
+The internal structure is also part of the contract.
+
+`tree.root` must be a node containing:
+
+```js
+{
+  leaf: boolean,
+  children: [...],
+  bounds: {
+    minX,
+    minY,
+    maxX,
+    maxY
+  }
+}
+```
+
+An empty root has `bounds === null`.
+
+For a leaf node, `children` contains the actual shape objects.
+
+For an internal node, `children` contains other nodes.
+
+All leaves must be at the same depth.
+
+Every node can have at most `maxEntries` children. Every non-root node must have at least the minimum fill.
+
+An internal root must have at least two children. A leaf root can contain anywhere from zero to `maxEntries` shapes.
+
+The bounds stored on every node must always be the exact minimum bounding rectangle of its children. Do not leave larger or outdated bounds behind.
+
+Each live shape must occur exactly once in the tree, using its current bounds and `z`.
+
+Do not keep another complete copy of the scene and scan that instead. Query results must come from the R-tree itself.
+
+Statistics:
+
+`tree.stats` must contain:
+
+* `nodeVisits`
+* `entryChecks`
+
+`nodeVisits` increases whenever a node is entered while running `queryRect` or `hitTest`.
+
+`entryChecks` increases whenever a shape is checked by a query.
+
+`resetStats()` must set both values back to zero.
+
+For a 50,000-shape scene, a query covering a small area should stay within:
+
+```text
+nodeVisits + entryChecks <= 400
+```
+
+This must still hold after tens of thousands of moves and deletions. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
+
+Cases to handle:
+
+Do not assume the input is random. The tests include cases such as:
+
+* many tiles sharing edges
+* very tight clusters
+* diagonal layouts
+* a few large shapes containing thousands of smaller shapes
+* shapes repeatedly moved between distant parts of the canvas
+* deleting everything and then inserting again
+* zero-area shapes
+
+After every operation, the tree must give the same results as a brute-force scan of the current live shapes.
 
 You have 9000 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.
