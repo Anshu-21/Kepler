@@ -30,10 +30,10 @@ for contract, _ in pairs:
     cid = contract["contract_id"]
     start = parse(contract["opening_date"])
     tr = contract["tranches"]
-    assert 2 <= len(tr) <= 20, cid
-    assert 6 <= contract["term_months"] <= 600 and 1 <= contract["anchor_day"] <= 31, cid
+    assert 2 <= len(tr) <= 10, cid
+    assert 6 <= contract["term_months"] <= 360 and 1 <= contract["anchor_day"] <= 31, cid
     assert 1 <= contract["notice_days"] <= 5, cid
-    assert len(contract["bookings"]) <= 16000 and len(contract["prepayments"]) <= 120, cid
+    assert len(contract["bookings"]) <= 2000 and len(contract["prepayments"]) <= 80, cid
     assert len(contract["collateral"]) == contract["term_months"], cid
     assert len(contract["collections"]) == contract["term_months"], cid
     assert is_business(start, set(contract["payment_holidays"])), cid
@@ -80,7 +80,7 @@ for contract, _ in pairs:
         locked_split += len(contract["prepayments"])
 from collections import Counter
 most = max(max(Counter(e["logical_id"] for e in c["bookings"]).values()) for c, _ in pairs)
-assert most >= 400, most  # a standing booking revised at almost every determination date
+assert most >= 200, most  # a standing booking revised at most determination dates
 assert flip_local >= 50 and flip_fixed >= 50 and flip_edge >= 5 and icma_span >= 20 and locked_split >= 20, \
     (flip_local, flip_fixed, flip_edge, icma_span, locked_split)
 off_ceil = off_round = circular = 0

@@ -1,8 +1,8 @@
 # Facility settlement specification
 
-A facility has several tranches on one payment schedule. On each payment date the desk works out what every tranche is owed and distributes that date's collections through the priority of payments. `reconcile(contract)` produces that settlement history for the whole term.
+A facility has several tranches on one payment schedule. On each payment date the desk works out what every tranche is owed and distributes that date's collections through the priority of payments; the result is that date's statement. This document defines settlement exactly, and the last sections define the reconstruction you are asked to build on top of it.
 
-Everything is in the contract file: each tranche's day count, rate terms, seniority and withholding, the reserve account, the calendars, the published SOFR fixings, the prepayments, the rate bookings and the cash collected for each payment date.
+Everything settlement needs is in the contract file: each tranche's day count, rate terms, seniority and withholding, the reserve account, the calendars, the published SOFR fixings, the prepayments, the rate bookings and the cash collected for each payment date.
 
 ## Schedule
 
@@ -103,16 +103,28 @@ Tranches with the same `seniority` are one level and share it pari passu: when t
 
 Afterwards `deferred_interest` is interest due minus interest paid, `principal_due` less `principal_paid` (floored at zero) carries to the next period's principal due, and the balance falls by principal paid and swept. That balance opens the next accrual period.
 
-## Output
+## Statements
 
-Return exactly `contract_id` and `periods`, one entry per period in order. Each period contains exactly `number`, `accrual_start`, `accrual_end`, `payment_date`, `determination_date` (ISO dates), `collections`, `fee_paid`, `reserve_draw`, `reserve_topup`, `reserve_balance`, `released` and `tranches`. `tranches` maps every `tranche_id` to exactly `interest`, `true_up`, `overdue_interest`, `interest_due`, `interest_paid`, `withholding`, `deferred_interest`, `principal_due`, `principal_paid`, `cure_paid`, `swept`, `closing_balance` and `default_margin`, the last a boolean saying whether the period accrued with the default margin.
+Settling a contract produces its statement: exactly `contract_id` and `periods`, one entry per period in order. Each period contains exactly `number`, `accrual_start`, `accrual_end`, `payment_date`, `determination_date` (ISO dates), `collections`, `fee_paid`, `reserve_draw`, `reserve_topup`, `reserve_balance`, `released` and `tranches`. `tranches` maps every `tranche_id` to exactly `interest`, `true_up`, `overdue_interest`, `interest_due`, `interest_paid`, `withholding`, `deferred_interest`, `principal_due`, `principal_paid`, `cure_paid`, `swept`, `closing_balance` and `default_margin`, the last a boolean saying whether the period accrued with the default margin. Money values are strings with exactly two decimals and a leading `-` only when negative, such as `"1250.00"` and `"-0.07"`.
 
-Money values are strings with exactly two decimals and a leading `-` only when negative, such as `"1250.00"` and `"-0.07"`. The input must not be modified.
+## Reconstruction
+
+The `RATE_CHANGE` records of the booking log were lost. For each affected facility the desk still has the contract, whose `bookings` now hold only the `FIXING_CORRECTION` records (with their revisions and retractions), and the statement it issued, which was produced by settling the complete contract.
+
+`reconstruct(contract, statement)` returns a list of `RATE_CHANGE` records such that settling the contract with them added to its `bookings` reproduces `statement` exactly, in every field of every period. Any such list is accepted; it does not have to be the one that was lost. Every returned record must be a valid booking under this specification:
+
+- `logical_id` is a string not used by any record already in the contract, `revision` is an integer, and the revisions of one `logical_id` are distinct.
+- `recorded_at` is an ISO 8601 timestamp with a UTC offset, and `action` is `SET` or `RETRACT`. `booking_id` may be omitted.
+- A `SET` record has `kind` `RATE_CHANGE`, a `tranche_id` of the contract, an `effective_date` strictly inside a period and at least five calendar days from every regular boundary, and `annual_rate` for a fixed tranche or `spread` for a floating one, as a decimal string with at most eight decimal places.
+- A `RETRACT` record has nothing else.
+- There are at most 5,000 records.
+
+The input must not be modified.
 
 ## Bounds
 
-Every contract, including the verifier's, has two to twenty tranches, `term_months` between 6 and 600, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 16,000 bookings and 120 prepayments, and fixings for every date a replay looks up.
+Every contract, including the verifier's, has two to six tranches, `term_months` between 6 and 120, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 2,000 bookings and 40 prepayments, and fixings for every date a replay looks up.
 
 ## Runtime
 
-`reconcile(contract)` gets 6 seconds of wall clock per contract, in a fresh single-threaded Python process, and the verifier's largest contracts sit at the bounds above.
+`reconstruct(contract, statement)` gets 120 seconds of wall clock per facility, in a fresh single-threaded Python process.

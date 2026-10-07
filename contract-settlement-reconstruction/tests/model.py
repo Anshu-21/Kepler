@@ -433,12 +433,34 @@ def settle(c, audit=None, cash_rule=None):
                 interest(lv); cure(lv); principal(lv)
         if rsv and k < term:
             remaining = sum((left(t) for t in ids), F(0))
+            sweeping = c["excess_cash"] == "SWEEP"
+            cum, run = {}, F(0)
+            for lv in levels:
+                run += sum((left(t) for t in by_level[lv]), F(0)); cum[lv] = run
+            base_rate = F(rsv["target_rate"]); step_rate = F(rsv.get("step_up_rate", rsv["target_rate"]))
+            step_tests = {int(k): F(v) for k, v in rsv.get("step_up_tests", {}).items()}
+
+            def swept_by(r):
+                return min(cash - r, remaining) if sweeping else F(0)
+
+            def breached(r):
+                # the sweep pays levels in ascending order, so it takes min(swept, cum) from levels up to lv
+                swept = swept_by(r)
+                return any((cum[lv] - min(swept, cum[lv])) * trig > collateral for lv, trig in step_tests.items() if lv in cum)
 
             def covered(r):
-                swept = min(cash - r, remaining) if c["excess_cash"] == "SWEEP" else F(0)
-                target = max(F(rsv["floor"]), round_cent(F(rsv["target_rate"]) * (remaining - swept)))
-                return reserve + r >= target
-            topup = smallest_cent(F(0), cash, covered)
+                swept = swept_by(r)
+                rate = step_rate if breached(r) else base_rate
+                return reserve + r >= max(F(rsv["floor"]), round_cent(rate * (remaining - swept)))
+            # less is swept as r grows, so a breach, once it appears, stays: covered is monotone on each side
+            first = smallest_cent(F(0), cash, breached)
+            pieces = [(F(0), cash)] if first is None else [(F(0), first - CENT), (first, cash)]
+            topup = None
+            for a, b in pieces:
+                if a <= b:
+                    topup = smallest_cent(a, b, covered)
+                    if topup is not None:
+                        break
             if topup is None:
                 topup = cash
             cash -= topup; reserve += topup
@@ -489,7 +511,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
          n_prepay=4, n_changes=6, n_fix=4, waterfall="INTEREST_FIRST", excess_cash="SWEEP",
          cash_mix=(0.08, 0.3, 0.8, 1.0, 1.0, 1.15, 1.4), floor_bias=False, coverage=None,
          collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None, lockout=None,
-         rebook=None):
+         rebook=None, moves=0.0):
     """Build one contract.  day_counts/kinds/seniority give one entry per tranche."""
     rng = random.Random(seed)
     start = parse(opening)
@@ -601,6 +623,10 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
                 bookings.append({"logical_id": lid, "revision": 2, "action": "SET", "recorded_at": stamp(r2), **alter(dict(body))})
             else:
                 bookings.append({"logical_id": lid, "revision": 2, "action": "RETRACT", "recorded_at": stamp(r2)})
+            if rng.random() < moves:
+                # a later revision that reached the log before revision 2 did
+                r3 = rec + (r2 - rec) * rng.uniform(0.2, 0.9)
+                bookings.append({"logical_id": lid, "revision": 3, "action": "SET", "recorded_at": stamp(r3), **alter(dict(body))})
 
     for n in range(n_changes):
         k = rng.randrange(1, term); tid = rng.choice(ids)
@@ -619,7 +645,17 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
         lid = f"RC-{n + 1:03d}"
         bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": stamp(rec), **body})
 
-        def alter(b):
+        def alter(b, k=k):
+            roll = rng.random()
+            if roll < moves / 2:
+                # booked against the wrong tranche: the revision moves it to another of the same kind
+                same = [x for x in ids if (x in floating) == ("spread" in b) and x != b["tranche_id"]
+                        and not (rebook and x in rebook)]
+                if same:
+                    b["tranche_id"] = rng.choice(same)
+            elif roll < moves:
+                # wrong effective date: moved up to six periods either way
+                b["effective_date"] = inside(min(term - 1, max(1, k + rng.randrange(-6, 7)))).isoformat()
             if "spread" in b:
                 b["spread"] = _spread(rng)
             else:
@@ -664,8 +700,16 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
         lid = f"FX-{n + 1:03d}"
         bookings.append({"logical_id": lid, "revision": 1, "action": "SET", "recorded_at": stamp(rec), **body})
 
-        def alter(b):
-            v = max(100, old + rng.choice((-90, -10, 15, 120)))
+        def alter(b, row=row):
+            if rng.random() < moves:
+                # wrong fixing date: moved to another date no other correction uses
+                while True:
+                    day2 = row["start"] + timedelta(days=rng.randrange(-20, max(1, (row["end"] - row["start"]).days) + 20))
+                    if day2.isoformat() in fixings and day2.isoformat() not in used:
+                        break
+                used.add(day2.isoformat())
+                b["fixing_date"] = day2.isoformat()
+            v = max(100, int(fixings[b["fixing_date"]].replace(".", "")) + rng.choice((-90, -10, 15, 120)))
             b["fixing"] = f"{v // 100}.{v % 100:02d}"
             return b
         revise(lid, body, rec, k, alter)

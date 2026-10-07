@@ -23,6 +23,7 @@ import bisect
 import calendar
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, ROUND_DOWN
+from fractions import Fraction
 
 from calendar_tools import add_months, modified_following, parse
 
@@ -445,9 +446,9 @@ def gross_up(net, rate):
     return gross
 
 
-def smallest_cent(limit, ok):
-    """Smallest whole-cent amount in [0, limit] satisfying a monotone ok, else None."""
-    lo, hi = 0, int(limit * 100)
+def smallest_cent(low, limit, ok):
+    """Smallest whole-cent amount in [low, limit] satisfying an ok that is monotone there, else None."""
+    lo, hi = int(low * 100), int(limit * 100)
     if not ok(Decimal(hi) / 100):
         return None
     while lo < hi:
@@ -507,8 +508,8 @@ def reconcile(contract):
         openings.append(dict(balance))
         margins.append({tid: margin_rate if deferred[tid] > 0 else ZERO for tid in ids})
         restate.settled = idx
-        restate.correct_fixings([(o, n) for o, n in changed
-                                 if (o or n)["kind"] == "FIXING_CORRECTION" or (n and n["kind"] == "FIXING_CORRECTION")])
+        fixing = lambda r: r if r is not None and r["kind"] == "FIXING_CORRECTION" else None
+        restate.correct_fixings([(fixing(o), fixing(n)) for o, n in changed if fixing(o) or fixing(n)])
         known = {}
         for r in log.live.values():
             if r["kind"] == "RATE_CHANGE":
@@ -606,12 +607,36 @@ def reconcile(contract):
             remaining = sum((outstanding(tid) for tid in ids), ZERO)
             sweep = contract["excess_cash"] == "SWEEP"
             floor, target_rate = Decimal(rsv["floor"]), Decimal(rsv["target_rate"])
+            step_rate = Decimal(rsv.get("step_up_rate", rsv["target_rate"]))
+            # The first top-up at which a step-up test fails on the post-sweep balances. The sweep takes
+            # min(swept, cum) from the levels up to lv, so test lv fails exactly when swept < cum - collateral / trigger,
+            # that is when r > cash - (cum - collateral / trigger). Less is swept as r grows, so once breached, always.
+            step_tests = {int(k): Decimal(v) for k, v in rsv.get("step_up_tests", {}).items()}
+            first, cum = None, ZERO
+            for lv in order:
+                cum += sum((outstanding(tid) for tid in levels[lv]), ZERO)
+                if lv not in step_tests:
+                    continue
+                need = Fraction(cum) - Fraction(collateral) / Fraction(step_tests[lv])
+                if need <= 0:
+                    continue
+                at = 0 if not sweep else max(0, (Fraction(cash) - need) * 100 // 1 + 1)
+                at = Decimal(int(at)) / 100
+                if at <= cash and (first is None or at < first):
+                    first = at
 
             def topped_up(r):
                 left = remaining - (min(cash - r, remaining) if sweep else ZERO)
-                return reserve + r >= max(floor, (target_rate * left).quantize(CENT, rounding=ROUND_HALF_UP))
+                rate = step_rate if first is not None and r >= first else target_rate
+                return reserve + r >= max(floor, (rate * left).quantize(CENT, rounding=ROUND_HALF_UP))
 
-            topup = smallest_cent(cash, topped_up)
+            # The step-up makes topped_up jump back to false at `first`, so it is only monotone on each side.
+            topup = None
+            for lo, hi in ([(ZERO, cash)] if first is None else [(ZERO, first - CENT), (first, cash)]):
+                if lo <= hi:
+                    topup = smallest_cent(lo, hi, topped_up)
+                    if topup is not None:
+                        break
             if topup is None:
                 topup = cash
             cash -= topup
