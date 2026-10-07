@@ -340,11 +340,10 @@ def pari_passu(cash, dues):
     have = int(cash * 100)
     if have >= total:
         return dict(dues), Decimal(total) / 100
-    shares, dropped = {}, {}
-    for t, c in cents.items():
-        shares[t], dropped[t] = divmod(have * c, total)
+    shares = {t: have * c // total for t, c in cents.items()}
     left = have - sum(shares.values())
-    for t in sorted(cents, key=lambda t: (-dropped[t], t))[:left]:
+    # desk practice (see data/history): leftover cents go to the largest amounts, ties by tranche id
+    for t in sorted(cents, key=lambda t: (-cents[t], t))[:left]:
         shares[t] += 1
     return {t: Decimal(s) / 100 for t, s in shares.items()}, cash
 
@@ -443,8 +442,9 @@ def reconcile(contract):
             current = max(current, ZERO)
             overdue = ZERO
             if idx:
-                days = (period["payment"] - schedule[idx - 1]["payment"]).days
-                overdue = (deferred[tid] * overdue_rate * days / 360).quantize(CENT, rounding=ROUND_HALF_UP)
+                # desk practice: the tranche's own day count over the payment-date gap
+                overdue = interest_amount(deferred[tid], overdue_rate, t["day_count"], schedule[idx - 1]["payment"],
+                                          period["payment"], termination, regular)
             principal_due = after if final else min(Decimal(t["scheduled_principal"]) + arrears[tid], after)
             rows[tid] = {"interest": interest, "true_up": true_up, "overdue_interest": overdue,
                          "interest_due": current + deferred[tid] + overdue, "interest_paid": ZERO, "withholding": ZERO,

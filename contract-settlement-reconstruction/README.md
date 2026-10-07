@@ -7,6 +7,7 @@ Explanations of the difficulty, the solution and the verification live in `task.
 | `environment/app/engine.py` | legacy engine the agent rewrites (the only collected artifact) |
 | `environment/app/SETTLEMENT_SPEC.md` | the settlement rules, output format and input bounds |
 | `environment/app/data/examples/` | one fully funded contract with expected output |
+| `environment/app/data/history/` | three settled statements from the model: the only source for the four desk-practice conventions |
 | `environment/app/data/sample_contract.json` | a 60-period contract using nearly every feature, without an answer |
 | `tests/model.py` | independent exact-arithmetic model (memoised, not incremental) and contract generator |
 | `tests/cases.py` | the eight sealed contract specs and their SHA-256 digest |

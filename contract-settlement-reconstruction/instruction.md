@@ -2,6 +2,8 @@
 
 Rewrite it so `reconcile(contract)` follows `/app/SETTLEMENT_SPEC.md` exactly, for every period of every tranche, to the cent.
 
+A few of the desk's conventions were never written into the spec; `/app/data/history/` has statements our production system settled, and they are the authority for those.
+
 `/app/data/examples/` has one contract with its expected output. It is fully funded and doesn't touch most of the spec, so matching it proves little. `/app/data/sample_contract.json` exercises nearly everything but has no answer. To run one:
 
 ```sh

@@ -69,7 +69,7 @@ EXTRA = {
 }
 
 # sha256 of the canonical JSON of every (contract, expected) pair; guards against generator drift
-DIGEST = "8608a181ac64ab04ebf116d88e430b9864bf2765cb9995f48e9404d080cfc049"
+DIGEST = "77aa919836db5772cdcd4709b6fbaa26248a6f2004fd7310d0007b83056df6fa"
 
 
 def build(spec):

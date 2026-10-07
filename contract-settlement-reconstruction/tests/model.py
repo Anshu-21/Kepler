@@ -251,7 +251,8 @@ def pari_passu(cash, dues):
         exact = cash * d / total
         paid[t] = F(int(exact * 100), 100); drop[t] = exact - paid[t]
     left = int((cash - sum(paid.values(), F(0))) * 100)
-    for t in sorted(dues, key=lambda t: (-drop[t], t))[:left]:
+    # desk practice: leftover cents go to the largest amounts first, not the largest remainders
+    for t in sorted(dues, key=lambda t: (-dues[t], t))[:left]:
         paid[t] += CENT
     return paid, cash
 
@@ -347,7 +348,10 @@ def settle(c, audit=None, cash_rule=None):
             overdue = F(0)
             if k > 1:
                 days = (row["payment"] - rows[k - 2]["payment"]).days
-                overdue = audit.half_up(deferred[tid] * F(c["overdue_rate"]) * days / 360, CENT)
+                # desk practice: the tranche's own day count over the payment-date gap
+                gap = fraction(rows[k - 2]["payment"], row["payment"], tranches[ids.index(tid)]["day_count"], termination,
+                               regular_boundaries(c["opening_date"], int(c["anchor_day"]), int(c["term_months"])))
+                overdue = audit.half_up(deferred[tid] * F(c["overdue_rate"]) * gap, CENT)
             b = after_prepay[tid]
             pdue = b if k == term else min(F(tranches[ids.index(tid)]["scheduled_principal"]) + arrears[tid], b)
             line[tid] = {"interest": cur[tid], "true_up": true_up, "overdue_interest": overdue,
