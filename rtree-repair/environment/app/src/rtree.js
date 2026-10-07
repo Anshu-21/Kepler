@@ -51,6 +51,7 @@ class Node {
     this.children = [];
     this.bounds = null;
     this.top = null; // best shape (highest z, then smallest id) anywhere below this node
+    this._o = 0; // epoch that created this node; only nodes of the current epoch are mutated in place
   }
 }
 
@@ -82,11 +83,65 @@ function checkBounds(o, what) {
   }
 }
 
+function queryImpl(root, stats, rect) {
+  checkBounds(rect, 'rect');
+  const out = [];
+  if (root.bounds && overlaps(root.bounds, rect)) {
+    (function go(node) {
+      stats.nodeVisits++;
+      if (node.leaf) {
+        for (const e of node.children) {
+          stats.entryChecks++;
+          if (overlaps(e, rect)) out.push(e);
+        }
+      } else {
+        for (const c of node.children) if (overlaps(c.bounds, rect)) go(c);
+      }
+    })(root);
+  }
+  out.sort((a, b) => cmpId(a.id, b.id));
+  return out.map((e) => ({ ...e }));
+}
+
+function hitImpl(root, stats, x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new RangeError('invalid point');
+  let best = null;
+  if (root.bounds && containsPoint(root.bounds, x, y)) {
+    (function go(node) {
+      stats.nodeVisits++;
+      if (node.leaf) {
+        for (const e of node.children) {
+          stats.entryChecks++;
+          if (containsPoint(e, x, y) && better(e, best)) best = e;
+        }
+      } else {
+        for (const c of node.children) if (containsPoint(c.bounds, x, y)) go(c);
+      }
+    })(root);
+  }
+  return best ? { ...best } : null;
+}
+
+// Read-only view of one version of a tree. Nodes are never mutated once a snapshot refers to them.
+class Snapshot {
+  constructor(root, size) {
+    this.root = root;
+    this._size = size;
+    this.stats = { nodeVisits: 0, entryChecks: 0 };
+  }
+  get size() { return this._size; }
+  resetStats() { this.stats.nodeVisits = 0; this.stats.entryChecks = 0; }
+  queryRect(rect) { return queryImpl(this.root, this.stats, rect); }
+  hitTest(x, y) { return hitImpl(this.root, this.stats, x, y); }
+}
+
 class RTree {
   constructor(options = {}) {
     this.maxEntries = options.maxEntries || DEFAULT_MAX_ENTRIES;
     this.minEntries = Math.ceil(this.maxEntries * 0.4);
+    this._epoch = 1;
     this.root = new Node(true);
+    this.root._o = 1;
     this._ids = new Map();
     this.stats = { nodeVisits: 0, entryChecks: 0 };
   }
@@ -129,6 +184,7 @@ class RTree {
     if (!entry) return false;
     const path = this._findPath(this.root, entry);
     if (!path) throw new Error('index corrupted: entry not reachable');
+    for (let i = 0; i < path.length; i++) path[i] = this._own(path[i], i ? path[i - 1] : null);
     const leaf = path[path.length - 1];
     leaf.children.splice(leaf.children.indexOf(entry), 1);
     this._ids.delete(id);
@@ -150,44 +206,27 @@ class RTree {
   }
 
   queryRect(rect) {
-    checkBounds(rect, 'rect');
-    const out = [];
-    if (this.root.bounds && overlaps(this.root.bounds, rect)) this._query(this.root, rect, out);
-    out.sort((a, b) => cmpId(a.id, b.id));
-    return out.map((e) => ({ ...e }));
+    return queryImpl(this.root, this.stats, rect);
   }
 
   hitTest(x, y) {
-    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new RangeError('invalid point');
-    const best = { e: null };
-    if (this.root.bounds && containsPoint(this.root.bounds, x, y)) this._hit(this.root, x, y, best);
-    return best.e ? { ...best.e } : null;
+    return hitImpl(this.root, this.stats, x, y);
   }
 
-  _query(node, rect, out) {
-    this.stats.nodeVisits++;
-    if (node.leaf) {
-      for (const e of node.children) {
-        this.stats.entryChecks++;
-        if (overlaps(e, rect)) out.push(e);
-      }
-    } else {
-      for (const c of node.children) if (overlaps(c.bounds, rect)) this._query(c, rect, out);
-    }
+  snapshot() {
+    this._epoch++;
+    return new Snapshot(this.root, this._ids.size);
   }
 
-  _hit(node, x, y, best) {
-    this.stats.nodeVisits++;
-    if (node.leaf) {
-      for (const e of node.children) {
-        this.stats.entryChecks++;
-        if (!containsPoint(e, x, y)) continue;
-        const b = best.e;
-        if (better(e, b)) best.e = e;
-      }
-    } else {
-      for (const c of node.children) if (containsPoint(c.bounds, x, y)) this._hit(c, x, y, best);
-    }
+  restore(view) {
+    if (!(view instanceof Snapshot)) throw new TypeError('not a snapshot');
+    this._epoch++;
+    this.root = view.root;
+  }
+
+  // copy-on-write: return a node this epoch may mutate, relinking it under its (owned) parent
+  _own(node, parent) {
+    return node;
   }
 
   _findPath(node, entry) {
@@ -216,10 +255,10 @@ class RTree {
   }
 
   _insertEntry(entry) {
-    const path = [this.root];
-    let n = this.root;
+    let n = this._own(this.root, null);
+    const path = [n];
     while (!n.leaf) {
-      n = this._choose(n, entry);
+      n = this._own(this._choose(n, entry), n);
       path.push(n);
     }
     n.children.push(entry);
@@ -231,6 +270,7 @@ class RTree {
         const sibling = this._split(node);
         if (i === 0) {
           const r = new Node(false);
+          r._o = this._epoch;
           r.children = [node, sibling];
           recalc(r);
           this.root = r;
@@ -263,6 +303,7 @@ class RTree {
       }
     }
     const sibling = new Node(node.leaf);
+    sibling._o = this._epoch;
     node.children = best.sorted.slice(0, best.k);
     sibling.children = best.sorted.slice(best.k + (best.ov > 0 ? 1 : 0));
     recalc(node);
@@ -271,4 +312,4 @@ class RTree {
   }
 }
 
-module.exports = { RTree, Node };
+module.exports = { RTree, Node, Snapshot };

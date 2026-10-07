@@ -10,7 +10,7 @@ CANDIDATE = os.environ.get("RTREE_FILE", "/app/src/rtree.js")
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness.js")
 SCENARIOS = [
     "contract", "sequence", "dist_grid", "dist_clusters", "dist_diagonal",
-    "dist_nested", "moving", "drain", "zorder", "tamper", "perf", "perf_hit",
+    "dist_nested", "moving", "drain", "zorder", "persist", "undo", "tamper", "perf", "perf_hit",
 ]
 
 

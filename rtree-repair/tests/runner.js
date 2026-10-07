@@ -10,6 +10,9 @@ const [, , file, tracePath, outPath] = process.argv;
 const ops = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
 const results = [];
 let tree = null;
+const views = {};
+const nids = new Map();
+const nid = (n) => { if (!nids.has(n)) nids.set(n, nids.size + 1); return nids.get(n); };
 
 function flush() {
   fs.writeFileSync(outPath, JSON.stringify(results));
@@ -22,7 +25,7 @@ const bx = (b) => (b ? { minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY 
 
 function dump(n, depth) {
   if (depth > 40) throw new Error('tree too deep');
-  const o = { leaf: n.leaf, bounds: bx(n.bounds), top: n.top === null ? null : n.top ? { id: n.top.id, z: n.top.z } : 'missing', children: [] };
+  const o = { nid: nid(n), leaf: n.leaf, bounds: bx(n.bounds), top: n.top === null ? null : n.top ? { id: n.top.id, z: n.top.z } : 'missing', children: [] };
   if (n.leaf) for (const e of n.children) o.children.push({ id: e.id, minX: e.minX, minY: e.minY, maxX: e.maxX, maxY: e.maxY, z: e.z });
   else for (const c of n.children) o.children.push(dump(c, depth + 1));
   return o;
@@ -55,6 +58,11 @@ function step(op) {
   if (kind === 'q') return { list: rows(tree.queryRect(op[1])) };
   if (kind === 'h') return { v: one(tree.hitTest(op[1], op[2])) };
   if (kind === 'S') return { size: tree.size, dump: dump(tree.root, 0) };
+  if (kind === 'snap') { views[op[1]] = tree.snapshot(); return {}; }
+  if (kind === 'restore') { tree.restore(views[op[1]]); return {}; }
+  if (kind === 'SV') { const v = views[op[1]]; return { size: v.size, dump: dump(v.root, 0) }; }
+  if (kind === 'qv') return { list: rows(views[op[1]].queryRect(op[2])) };
+  if (kind === 'hv') return { v: one(views[op[1]].hitTest(op[2], op[3])) };
   if (kind === 'M') {
     const r = tree.queryRect(op[1]);
     if (r.length) { r[0].minX = 12345; r[0].z = -777; }

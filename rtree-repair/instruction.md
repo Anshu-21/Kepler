@@ -110,11 +110,21 @@ An internal root must have at least two children. A leaf root can contain anywhe
 
 The bounds stored on every node must always be the exact minimum bounding rectangle of its children. Do not leave larger or outdated bounds behind.
 
-Every node's `top` is the shape that `hitTest` would choose if the point were inside every shape below that node: the highest `z`, and the smallest ID among shapes with that `z`. It must be exact at all times, including after a `z` change, a removal of the current top shape, a split or a reinsertion. In a real scene hundreds of large shapes can be stacked over the same point, so `hitTest` is expected to use `top` to avoid looking at shapes that cannot win.
+Every node's `top` is the shape that `hitTest` would choose if the point were inside every shape below that node: the highest `z`, and the smallest ID among shapes with that `z`. It must be exact at all times, including after a `z` change, a removal of the current top shape, a split or a reinsertion. In a real scene hundreds of large shapes can be stacked over the same point.
 
 Each live shape must occur exactly once in the tree, using its current bounds and `z`.
 
 Do not keep another complete copy of the scene and scan that instead. Query results must come from the R-tree itself.
+
+Versions and undo:
+
+The editor's undo stack keeps old versions of the scene, so the tree must be persistent.
+
+`snapshot()` returns a read-only view of the tree as it is at that moment, in constant time. The view has `root`, `size`, `queryRect`, `hitTest`, `stats` and `resetStats`, behaving exactly like the same members of the tree, and its `root` obeys every structural rule above.
+
+No later `insert`, `remove`, `update` or `restore` on the tree may change anything a snapshot reports, including node bounds and `top`. Nodes that an operation did not need to change must stay shared between the versions instead of being copied: a single `insert`, `remove` or `update` may create at most 40 new node objects that are not already part of the previous version.
+
+`restore(view)` makes the tree equal to a snapshot taken from it earlier (it may take time proportional to the number of shapes). The tree can then be changed again, and neither that snapshot nor any other may be affected. The snapshot can be restored again later.
 
 Statistics:
 
@@ -148,6 +158,7 @@ Do not assume the input is random. The tests include cases such as:
 * shapes repeatedly moved between distant parts of the canvas
 * deleting everything and then inserting again
 * zero-area shapes
+* snapshots taken after every single operation, then compared with the scene as it was, and undo to an old version followed by new edits
 * many shapes with the same `z`, and `z` changes on shapes that are the current `top` of their ancestors
 
 After every operation, the tree must give the same results as a brute-force scan of the current live shapes.

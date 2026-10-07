@@ -11,6 +11,7 @@ const { spawnSync } = require('child_process');
 
 const MAX = 9;
 const MIN = 4;
+const NEW_PER_OP = Number(process.env.RT_NEW_PER_OP || 40);
 const RECT_BUDGET = Number(process.env.RT_RECT_BUDGET || 400);
 const HIT_BUDGET = Number(process.env.RT_HIT_BUDGET || 500);
 
@@ -64,7 +65,24 @@ class Gen {
   q(r) { this.ops.push(['q', r]); }
   h(x, y) { this.ops.push(['h', x, y]); }
   S() { this.ops.push(['S']); }
-  fresh() { this.ops.push(['new']); this.ref = new Ref(); }
+  snap(name) { this.ops.push(['snap', name]); this.snaps = this.snaps || {}; const c = new Ref(); for (const [k, v] of this.ref.m) c.m.set(k, v); this.snaps[name] = c; }
+  restore(name) { this.ops.push(['restore', name]); const c = new Ref(); for (const [k, v] of this.snaps[name].m) c.m.set(k, v); this.ref = c; }
+  SV(name) { this.ops.push(['SV', name]); }
+  probesV(rand, name, W, H, nr, np, scale) {
+    const list = [...this.snaps[name].m.values()];
+    for (let i = 0; i < nr; i++) {
+      const o = list.length && rand() < 0.5 ? list[Math.floor(rand() * list.length)] : null;
+      if (o) this.ops.push(['qv', name, { minX: o.minX - 1, minY: o.minY - 1, maxX: o.maxX + scale, maxY: o.maxY + scale }]);
+      else { const x = rand() * W, y = rand() * H; this.ops.push(['qv', name, { minX: x, minY: y, maxX: x + scale * 3, maxY: y + scale * 3 }]); }
+    }
+    for (let i = 0; i < np; i++) {
+      const o = list.length && rand() < 0.7 ? list[Math.floor(rand() * list.length)] : null;
+      if (o) this.ops.push(['hv', name, (o.minX + o.maxX) / 2, (o.minY + o.maxY) / 2]);
+      else this.ops.push(['hv', name, rand() * W, rand() * H]);
+    }
+  }
+  NEW(a, b, limit) { this.ops.push(['NEW', a, b, limit]); }
+  fresh() { this.ops.push(['new']); this.ref = new Ref(); this.snaps = {}; }
   probes(rand, W, H, nr, np, scale) {
     const list = [...this.ref.m.values()];
     for (let i = 0; i < nr; i++) {
@@ -296,6 +314,67 @@ SC.zorder = () => {
   return g.ops;
 };
 
+SC.persist = () => {
+  // every op is bracketed by snapshots: untouched nodes must be shared, the old version must stay intact
+  const rand = rng(404);
+  const g = new Gen();
+  const W = 4000, H = 4000;
+  for (let i = 0; i < 3000; i++) g.ins({ id: `e${i}`, ...box(rand() * W, rand() * H, 2 + rand() * 30, 2 + rand() * 30), z: Math.floor(rand() * 9) });
+  let prev = 'v0';
+  g.snap(prev); g.SV(prev);
+  const names = [prev];
+  for (let i = 1; i <= 160; i++) {
+    const ids = [...g.ref.m.keys()];
+    const r = rand();
+    if (r < 0.3) g.rm(ids[Math.floor(rand() * ids.length)]);
+    else if (r < 0.7) g.upd(ids[Math.floor(rand() * ids.length)], { ...box(rand() * W, rand() * H, 2 + rand() * 30, 2 + rand() * 30), z: Math.floor(rand() * 9) });
+    else g.ins({ id: `f${i}`, ...box(rand() * W, rand() * H, 2 + rand() * 30, 2 + rand() * 30), z: Math.floor(rand() * 9) });
+    const cur = `v${i}`;
+    g.snap(cur); g.SV(cur);
+    g.NEW(prev, cur, NEW_PER_OP);
+    names.push(cur);
+    prev = cur;
+  }
+  for (const n of names.filter((_, i) => i % 7 === 0)) { g.SV(n); g.probesV(rand, n, W, H, 12, 12, 30); }
+  g.S();
+  return g.ops;
+};
+
+SC.undo = () => {
+  // undo/redo: restore() to old versions, branch off them, keep every version intact
+  const rand = rng(515);
+  const g = new Gen();
+  const W = 3000, H = 3000;
+  const rid = () => `u${Math.floor(rand() * 1e9)}`;
+  const mutate = (n) => {
+    for (let i = 0; i < n; i++) {
+      const ids = [...g.ref.m.keys()];
+      const r = rand();
+      if (r < 0.3 && ids.length > 20) g.rm(ids[Math.floor(rand() * ids.length)]);
+      else if (r < 0.65 && ids.length) g.upd(ids[Math.floor(rand() * ids.length)], { ...box(rand() * W, rand() * H, 2 + rand() * 40, 2 + rand() * 40), z: Math.floor(rand() * 9) });
+      else g.ins({ id: rid(), ...box(rand() * W, rand() * H, 2 + rand() * 40, 2 + rand() * 40), z: Math.floor(rand() * 9) });
+    }
+  };
+  mutate(1500);
+  const names = [];
+  for (let round = 0; round < 25; round++) {
+    const n = `r${round}`;
+    g.snap(n); names.push(n);
+    mutate(40 + Math.floor(rand() * 200));
+    g.check(rand, W, H, 8, 8, 30);
+    if (round % 3 === 2) {
+      const back = names[Math.floor(rand() * names.length)];
+      g.restore(back);
+      g.S();
+      g.probes(rand, W, H, 10, 10, 30);
+      mutate(60);
+      g.check(rand, W, H, 8, 8, 30);
+    }
+  }
+  for (const n of names) { g.SV(n); g.probesV(rand, n, W, H, 10, 10, 30); }
+  return g.ops;
+};
+
 SC.tamper = () => {
   const rand = rng(3);
   const g = new Gen();
@@ -454,6 +533,8 @@ function listMatches(got, exp, what) {
 
 function judge(ops, res) {
   let ref = new Ref();
+  let snaps = {};
+  const ids = {};
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     const r = res[i];
@@ -461,7 +542,28 @@ function judge(ops, res) {
     assert(!r.error, `step ${i} (${op[0]}) crashed: ${r.error}`);
     const at = `step ${i}`;
     switch (op[0]) {
-      case 'new': ref = new Ref(); break;
+      case 'new': ref = new Ref(); snaps = {}; break;
+      case 'snap': { const c = new Ref(); for (const [k, v] of ref.m) c.m.set(k, v); snaps[op[1]] = c; break; }
+      case 'restore': { const c = new Ref(); for (const [k, v] of snaps[op[1]].m) c.m.set(k, v); ref = c; break; }
+      case 'SV': {
+        checkStructure(r.dump, r.size, snaps[op[1]]);
+        const set = new Set();
+        (function w(n) { set.add(n.nid); if (!n.leaf) n.children.forEach(w); })(r.dump);
+        ids[op[1]] = set;
+        break;
+      }
+      case 'qv': listMatches(r.list, snaps[op[1]].query(op[2]), `${at}: queryRect on snapshot ${op[1]}`); break;
+      case 'hv': {
+        const exp = snaps[op[1]].hit(op[2], op[3]);
+        assert((r.v === null) === (exp === null) && (!exp || rowKey(r.v) === key(exp)), `${at}: hitTest on snapshot ${op[1]} mismatch`);
+        break;
+      }
+      case 'NEW': {
+        let fresh = 0;
+        for (const id of ids[op[2]]) if (!ids[op[1]].has(id)) fresh++;
+        assert(fresh <= op[3], `${at}: one operation created ${fresh} new nodes (limit ${op[3]}); unchanged nodes must be shared between versions`);
+        break;
+      }
       case 'ins': {
         const exp = !(validBounds(op[1]) && typeof op[1].id === 'string' && !ref.m.has(op[1].id));
         assert(r.threw === exp, `${at}: insert(${op[1].id}) ${exp ? 'must throw' : 'must not throw'}`);
