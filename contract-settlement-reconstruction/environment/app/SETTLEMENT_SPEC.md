@@ -111,7 +111,7 @@ Money values are strings with exactly two decimals and a leading `-` only when n
 
 ## Bounds
 
-Every contract, including the verifier's, has two to twenty tranches, `term_months` between 6 and 600, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 12,000 bookings and 120 prepayments, and fixings for every date a replay looks up.
+Every contract, including the verifier's, has two to twenty tranches, `term_months` between 6 and 600, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 16,000 bookings and 120 prepayments, and fixings for every date a replay looks up.
 
 ## Runtime
 

@@ -33,7 +33,7 @@ for contract, _ in pairs:
     assert 2 <= len(tr) <= 20, cid
     assert 6 <= contract["term_months"] <= 600 and 1 <= contract["anchor_day"] <= 31, cid
     assert 1 <= contract["notice_days"] <= 5, cid
-    assert len(contract["bookings"]) <= 12000 and len(contract["prepayments"]) <= 120, cid
+    assert len(contract["bookings"]) <= 16000 and len(contract["prepayments"]) <= 120, cid
     assert len(contract["collateral"]) == contract["term_months"], cid
     assert len(contract["collections"]) == contract["term_months"], cid
     assert is_business(start, set(contract["payment_holidays"])), cid

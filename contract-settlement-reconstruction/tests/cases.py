@@ -16,14 +16,14 @@ SPECS = [
          n_prepay=110, n_changes=60, n_fix=150, coverage={"2": "3.50", "5": "2.20"}, collateral_mix=LOW,
          withholding={"B": "0.30", "D": "0.15", "G": "0.20", "J": "0.15", "N": "0.30"},
          reserve={"opening_balance": "18000.00", "target_rate": "0.0300", "floor": "15000.00", "covers": [1, 2]},
-         lockout={"B": 2, "H": 3, "M": 1}, rebook={t: (5, 0.97) for t in "ABCDEFGHIJKLMNOPQR"}),
+         lockout={"B": 2, "H": 3, "M": 1}, rebook={t: (5, 1.0) for t in "ABCDEFGHIJKLMNOPQRS"}),
     dict(seed=7102, opening="2031-08-29", term=576, anchor=29, accrual_dates="UNADJUSTED",
          day_counts=[DC20[(i + 3) % 7] for i in range(19)], kinds=[KINDS[(i + 2) % 5] for i in range(19)],
          seniority=[1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 10, 11, 12, 12], notice_days=5,
          n_prepay=100, n_changes=120, n_fix=200, waterfall="LEVEL_BY_LEVEL", floor_bias=True,
          coverage={"1": "5.00", "3": "2.00"}, collateral_mix=LOW, withholding={"A": "0.15", "C": "0.30", "E": "0.20"},
          reserve={"opening_balance": "20000.00", "target_rate": "0.0175", "floor": "20000.00", "covers": [1, 2, 3]},
-         lockout={"A": 1, "E": 3, "K": 2}, rebook={t: (4, 0.95) for t in "ABCDEFGHIJKLMNOPQ"}),
+         lockout={"A": 1, "E": 3, "K": 2}, rebook={t: (4, 1.0) for t in "ABCDEFGHIJKLMNOPQR"}),
     dict(seed=7103, opening="2029-03-15", term=540, anchor=15, accrual_dates="ADJUSTED",
          day_counts=list(ALL) * 2 + ["ACT/360", "ACT/365F", "ACT/360", "ACT/360"],
          kinds=[KINDS[(i + 4) % 5] for i in range(18)],
@@ -32,7 +32,7 @@ SPECS = [
          collateral_mix=LOW, cash_mix=(0.02, 0.1, 0.3, 0.8, 1.0, 1.0, 1.2, 1.5),
          withholding={"C": "0.20", "D": "0.15", "H": "0.30"},
          reserve={"opening_balance": "0.00", "target_rate": "0.0250", "floor": "10000.00", "covers": [1, 2, 3]},
-         lockout={"A": 2, "C": 2, "H": 1}, rebook={t: (6, 0.9) for t in "ABCDEFGHIJKLMNO"}),
+         lockout={"A": 2, "C": 2, "H": 1}, rebook={t: (6, 1.0) for t in "ABCDEFGHIJKLMNOP"}),
     # small contracts aimed at specific rules
     dict(seed=6104, opening="2029-02-28", term=12, anchor=31, accrual_dates="UNADJUSTED",
          day_counts=["30E/360 ISDA", "30/360", "30E/360 ISDA"], kinds=["FIXED", "FLOATING", "FLOATING"],
@@ -71,7 +71,7 @@ EXTRA = {
 }
 
 # sha256 of the canonical JSON of every (contract, expected) pair; guards against generator drift
-DIGEST = "e3aba49338d5c486b9afa7860d9669bcd89f17f49a0a7e90be7f746de7e08858"
+DIGEST = "a521ecccade36151f995f9bcd5b0138febf31e2e09b3d36eaa0c4e2d99d63f04"
 
 
 def build(spec):
