@@ -21,8 +21,15 @@ function containsBox(outer, inner) {
   );
 }
 
+// Coordinates may be anywhere in the finite double range, so differences and products are taken on
+// coordinates scaled down by 2^-600; the heuristics only need relative sizes.
+const SCALE = 2 ** -600;
 function area(b) {
-  return (b.maxX - b.minX) * (b.maxY - b.minY);
+  return (b.maxX * SCALE - b.minX * SCALE) * (b.maxY * SCALE - b.minY * SCALE);
+}
+
+function margin(b) {
+  return b.maxX * SCALE - b.minX * SCALE + (b.maxY * SCALE - b.minY * SCALE);
 }
 
 function union(a, b) {
@@ -35,8 +42,8 @@ function union(a, b) {
 }
 
 function intersectionArea(a, b) {
-  const w = Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX);
-  const h = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+  const w = Math.min(a.maxX, b.maxX) * SCALE - Math.max(a.minX, b.minX) * SCALE;
+  const h = Math.min(a.maxY, b.maxY) * SCALE - Math.max(a.minY, b.minY) * SCALE;
   return w > 0 && h > 0 ? w * h : 0;
 }
 
@@ -137,6 +144,53 @@ function hitImpl(root, stats, x, y) {
   return best ? { ...best } : null;
 }
 
+// The k best shapes (highest z, then smallest id) intersecting rect, best first. Best-first search:
+// a node is keyed by its top shape, which no shape below it can beat.
+function queryTopImpl(root, stats, rect, k) {
+  checkBounds(rect, 'rect');
+  if (!Number.isInteger(k) || k < 1) throw new RangeError('invalid k');
+  const out = [];
+  if (!root.bounds || !overlaps(root.bounds, rect)) return out;
+  const heap = [];
+  const up = (i) => {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!better(heap[i].t, heap[p].t)) break;
+      [heap[i], heap[p]] = [heap[p], heap[i]];
+      i = p;
+    }
+  };
+  const down = (i) => {
+    for (;;) {
+      let m = i;
+      const l = 2 * i + 1, r = l + 1;
+      if (l < heap.length && better(heap[l].t, heap[m].t)) m = l;
+      if (r < heap.length && better(heap[r].t, heap[m].t)) m = r;
+      if (m === i) break;
+      [heap[i], heap[m]] = [heap[m], heap[i]];
+      i = m;
+    }
+  };
+  const push = (it) => { heap.push(it); up(heap.length - 1); };
+  push({ t: root.top, node: root });
+  while (heap.length && out.length < k) {
+    const it = heap[0];
+    const last = heap.pop();
+    if (heap.length) { heap[0] = last; down(0); }
+    if (!it.node) { out.push({ ...it.t }); continue; }
+    stats.nodeVisits++;
+    if (it.node.leaf) {
+      for (const e of it.node.children) {
+        stats.entryChecks++;
+        if (overlaps(e, rect)) push({ t: e, node: null });
+      }
+    } else {
+      for (const c of it.node.children) if (overlaps(c.bounds, rect)) push({ t: c.top, node: c });
+    }
+  }
+  return out;
+}
+
 // Read-only view of one version of a tree. Nodes are never mutated once a snapshot refers to them.
 class Snapshot {
   constructor(root, size) {
@@ -148,6 +202,7 @@ class Snapshot {
   resetStats() { this.stats.nodeVisits = 0; this.stats.entryChecks = 0; }
   queryRect(rect) { return queryImpl(this.root, this.stats, rect); }
   hitTest(x, y) { return hitImpl(this.root, this.stats, x, y); }
+  queryTop(rect, k) { return queryTopImpl(this.root, this.stats, rect, k); }
 }
 
 class RTree {
@@ -233,6 +288,10 @@ class RTree {
     return hitImpl(this.root, this.stats, x, y);
   }
 
+  queryTop(rect, k) {
+    return queryTopImpl(this.root, this.stats, rect, k);
+  }
+
   snapshot() {
     this._epoch++;
     return new Snapshot(this.root, this._ids.size);
@@ -277,11 +336,14 @@ class RTree {
     let best = null;
     let bestEnl = Infinity;
     let bestArea = Infinity;
+    let bestMEnl = Infinity;
     for (const c of node.children) {
       const a = area(c.bounds);
-      const enl = area(union(c.bounds, entry)) - a;
-      if (enl < bestEnl || (enl === bestEnl && a < bestArea)) {
-        best = c; bestEnl = enl; bestArea = a;
+      const u = union(c.bounds, entry);
+      const enl = area(u) - a;
+      const menl = margin(u) - margin(c.bounds);
+      if (best === null || enl < bestEnl || (enl === bestEnl && (menl < bestMEnl || (menl === bestMEnl && a < bestArea)))) {
+        best = c; bestEnl = enl; bestArea = a; bestMEnl = menl;
       }
     }
     return best;
@@ -327,8 +389,9 @@ class RTree {
             const br = mbr(sorted.slice(k));
             const ov = intersectionArea(bl, br);
             const ar = area(bl) + area(br);
-            if (!best || ov < best.ov || (ov === best.ov && ar < best.ar)) {
-              best = { ov, ar, sorted, k };
+            const mg = margin(bl) + margin(br);
+            if (!best || ov < best.ov || (ov === best.ov && (ar < best.ar || (ar === best.ar && mg < best.mg)))) {
+              best = { ov, ar, mg, sorted, k };
             }
           }
         }

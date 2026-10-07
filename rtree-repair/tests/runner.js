@@ -56,6 +56,8 @@ function step(op) {
   if (kind === 'upd') { try { tree.update(op[1], op[2]); return { threw: false }; } catch (e) { return { threw: true }; } }
   if (kind === 'rm') return { v: tree.remove(op[1]) };
   if (kind === 'q') return { list: rows(tree.queryRect(op[1])) };
+  if (kind === 'qt') return { list: rows(tree.queryTop(op[1], op[2])) };
+  if (kind === 'qtv') return { list: rows(views[op[1]].queryTop(op[2], op[3])) };
   if (kind === 'h') return { v: one(tree.hitTest(op[1], op[2])) };
   if (kind === 'S') return { size: tree.size, dump: dump(tree.root, 0) };
   if (kind === 'snap') { views[op[1]] = tree.snapshot(); return {}; }
@@ -86,7 +88,14 @@ function step(op) {
       trap = trap || v;
       hits.push({ v: one(h), rep: tree.stats.nodeVisits + tree.stats.entryChecks });
     }
-    return { items, hits, trap, dump: dump(tree.root, 0), size: tree.size };
+    const tops = [];
+    for (const rc of op[3] || []) {
+      tree.resetStats();
+      const [list, v] = guarded(() => tree.queryTop(rc, op[4]));
+      trap = trap || v;
+      tops.push({ list: rows(list), rep: tree.stats.nodeVisits + tree.stats.entryChecks });
+    }
+    return { items, hits, tops, trap, dump: dump(tree.root, 0), size: tree.size };
   }
   if (kind === 'T') {
     let leaf = tree.root;

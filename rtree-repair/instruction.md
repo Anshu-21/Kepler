@@ -19,7 +19,7 @@ A shape is a plain object containing:
 * `minX <= maxX` and `minY <= maxY`
 * optional numeric `z`, which defaults to `0`
 
-Zero-width and zero-height shapes are valid.
+Zero-width and zero-height shapes are valid. Coordinates may be any finite double, from the smallest subnormal up to `Number.MAX_VALUE` in magnitude and of either sign, so a difference or product of coordinates can overflow. No operation may throw, return a wrong answer or build a broken tree because of that.
 
 IDs must be compared using normal JavaScript string ordering (`<`). Do not use locale-based sorting. For example, `"Zed"` comes before `"apple"` and `"a10"` comes before `"a2"`.
 
@@ -37,6 +37,7 @@ The tree must provide:
 * `update(id, bounds)`
 * `queryRect(rect)`
 * `hitTest(x, y)`
+* `queryTop(rect, k)`
 * `size` getter
 * `resetStats()`
 
@@ -47,6 +48,8 @@ The tree must provide:
 `update(id, bounds)` changes the shape's bounds. It may also receive a new `z`; if `z` is not supplied, keep the old value. It must throw if the ID does not exist or the new bounds are invalid. If the operation throws, nothing in the tree may be changed.
 
 `queryRect(rect)` returns fresh copies of all shapes whose boxes intersect the supplied rectangle. Results must be sorted by ID.
+
+`queryTop(rect, k)` takes an integer `k >= 1` and returns fresh copies of the `k` best shapes among those that intersect `rect`, or fewer if fewer intersect. Best means highest `z`, and the smaller ID among equal `z`; the result is ordered best first.
 
 `hitTest(x, y)` returns a fresh copy of the shape containing the point with the highest `z`. If multiple shapes have the same `z`, the smaller ID wins. Return `null` when no shape contains the point.
 
@@ -120,7 +123,7 @@ Versions and undo:
 
 The editor's undo stack keeps old versions of the scene, so the tree must be persistent.
 
-`snapshot()` returns a read-only view of the tree as it is at that moment, in constant time. The view has `root`, `size`, `queryRect`, `hitTest`, `stats` and `resetStats`, behaving exactly like the same members of the tree, and its `root` obeys every structural rule above.
+`snapshot()` returns a read-only view of the tree as it is at that moment, in constant time. The view has `root`, `size`, `queryRect`, `queryTop`, `hitTest`, `stats` and `resetStats`, behaving exactly like the same members of the tree, and its `root` obeys every structural rule above.
 
 No later `insert`, `remove`, `update` or `restore` on the tree may change anything a snapshot reports, including node bounds and `top`. Nodes that an operation did not need to change must stay shared between the versions instead of being copied: a single `insert`, `remove` or `update` may create at most 40 new node objects that are not already part of the previous version.
 
@@ -133,7 +136,7 @@ Statistics:
 * `nodeVisits`
 * `entryChecks`
 
-`nodeVisits` increases whenever a node is entered while running `queryRect` or `hitTest`.
+`nodeVisits` increases whenever a node is entered while running `queryRect`, `queryTop` or `hitTest`.
 
 `entryChecks` increases whenever a shape is checked by a query.
 
@@ -145,7 +148,7 @@ For a 50,000-shape scene, a query covering a small area should stay within:
 nodeVisits + entryChecks <= 400
 ```
 
-This must still hold after tens of thousands of moves and deletions. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
+This must still hold after tens of thousands of moves and deletions, and also when the shapes were inserted in sweep order (all of one axis in increasing order) instead of at random. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`, and `queryTop` with a 100 by 100 rectangle and `k = 3` within 600. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
 
 Cases to handle:
 
@@ -158,6 +161,8 @@ Do not assume the input is random. The tests include cases such as:
 * shapes repeatedly moved between distant parts of the canvas
 * deleting everything and then inserting again
 * zero-area shapes
+* coordinates of wildly different magnitude in one scene (`1e-300` next to `1e300`, `Number.MIN_VALUE`, `-0`)
+* shapes inserted in sorted order
 * snapshots taken after every single operation, then compared with the scene as it was, and undo to an old version followed by new edits
 * many shapes with the same `z`, and `z` changes on shapes that are the current `top` of their ancestors
 

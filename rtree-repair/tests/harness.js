@@ -12,6 +12,8 @@ const { spawnSync } = require('child_process');
 const MAX = 9;
 const MIN = 4;
 const NEW_PER_OP = Number(process.env.RT_NEW_PER_OP || 40);
+const TOP_BUDGET = Number(process.env.RT_TOP_BUDGET || 600);
+const SORT_BUDGET = Number(process.env.RT_SORT_BUDGET || 400);
 const RECT_BUDGET = Number(process.env.RT_RECT_BUDGET || 400);
 const HIT_BUDGET = Number(process.env.RT_HIT_BUDGET || 500);
 
@@ -65,6 +67,7 @@ class Gen {
   q(r) { this.ops.push(['q', r]); }
   h(x, y) { this.ops.push(['h', x, y]); }
   S() { this.ops.push(['S']); }
+  qt(r, k) { this.ops.push(['qt', r, k]); }
   snap(name) { this.ops.push(['snap', name]); this.snaps = this.snaps || {}; const c = new Ref(); for (const [k, v] of this.ref.m) c.m.set(k, v); this.snaps[name] = c; }
   restore(name) { this.ops.push(['restore', name]); const c = new Ref(); for (const [k, v] of this.snaps[name].m) c.m.set(k, v); this.ref = c; }
   SV(name) { this.ops.push(['SV', name]); }
@@ -375,6 +378,71 @@ SC.undo = () => {
   return g.ops;
 };
 
+SC.topk = () => {
+  const rand = rng(61);
+  const g = new Gen();
+  for (let i = 0; i < 1500; i++) g.ins({ id: `k${i}`, ...box(rand() * 600, rand() * 600, 5 + rand() * 150, 5 + rand() * 150), z: Math.floor(rand() * 15) });
+  const qts = () => { for (let i = 0; i < 25; i++) { const x = rand() * 600, y = rand() * 600; g.qt({ minX: x, minY: y, maxX: x + rand() * 120, maxY: y + rand() * 120 }, 1 + Math.floor(rand() * 8)); } };
+  g.S(); qts();
+  g.qt({ minX: -1e9, minY: -1e9, maxX: 1e9, maxY: 1e9 }, 5); g.qt({ minX: -1e9, minY: -1e9, maxX: 1e9, maxY: 1e9 }, 5000); g.qt({ minX: 3, minY: 3, maxX: 3, maxY: 9 }, 2);
+  for (let step = 0; step < 2500; step++) {
+    const ids = [...g.ref.m.keys()];
+    const id = ids[Math.floor(rand() * ids.length)];
+    const r = rand();
+    if (r < 0.3) { const o = g.ref.m.get(id); g.upd(id, { minX: o.minX, minY: o.minY, maxX: o.maxX, maxY: o.maxY, z: Math.floor(rand() * 15) }); }
+    else if (r < 0.5) g.rm(id);
+    else if (r < 0.75) g.upd(id, box(rand() * 600, rand() * 600, 5 + rand() * 150, 5 + rand() * 150));
+    else g.ins({ id: `kk${step}`, ...box(rand() * 600, rand() * 600, 5 + rand() * 150, 5 + rand() * 150), z: Math.floor(rand() * 15) });
+    if (step % 100 === 0) { g.S(); qts(); }
+  }
+  g.snap('a'); g.upd([...g.ref.m.keys()][0], box(1, 1, 5, 5)); g.rm([...g.ref.m.keys()][3]);
+  for (let i = 0; i < 20; i++) g.ops.push(['qtv', 'a', box(rand() * 500, rand() * 500, 100, 100), 4]);
+  return g.ops;
+};
+
+SC.extreme = () => {
+  // coordinates anywhere in the finite double range: naive area/enlargement arithmetic overflows
+  const rand = rng(8);
+  const g = new Gen();
+  const MAXV = Number.MAX_VALUE;
+  const val = () => {
+    const r = rand();
+    if (r < 0.04) return 0;
+    if (r < 0.06) return -0;
+    if (r < 0.08) return Number.MIN_VALUE;
+    if (r < 0.10) return MAXV;
+    if (r < 0.12) return -MAXV;
+    const sgn = rand() < 0.5 ? -1 : 1;
+    return sgn * Math.pow(10, -300 + rand() * 608);
+  };
+  const shape = () => {
+    let a = val(), b = val(), c = val(), d = val();
+    if (rand() < 0.3) { b = a; }
+    if (rand() < 0.2) { d = c; }
+    return { minX: Math.min(a, b), maxX: Math.max(a, b), minY: Math.min(c, d), maxY: Math.max(c, d) };
+  };
+  const ids = [];
+  for (let i = 0; i < 700; i++) { const o = { id: `x${i}`, ...shape(), z: Math.floor(rand() * 5) }; g.ins(o); ids.push(o.id); }
+  const probe = () => {
+    for (let i = 0; i < 12; i++) g.q(shape());
+    for (let i = 0; i < 8; i++) g.qt(shape(), 3);
+    const list = [...g.ref.m.values()];
+    for (let i = 0; i < 12; i++) { const o = list[Math.floor(rand() * list.length)]; g.h(o.minX, o.minY); g.h(o.maxX, o.maxY); g.h(val(), val()); }
+  };
+  g.S(); probe();
+  for (let step = 0; step < 1500; step++) {
+    const live = [...g.ref.m.keys()];
+    const id = live[Math.floor(rand() * live.length)];
+    const r = rand();
+    if (r < 0.3) g.rm(id);
+    else if (r < 0.65) g.upd(id, { ...shape(), z: Math.floor(rand() * 5) });
+    else g.ins({ id: `y${step}`, ...shape(), z: Math.floor(rand() * 5) });
+    if (step % 50 === 0) { g.S(); probe(); }
+  }
+  g.S(); probe();
+  return g.ops;
+};
+
 SC.tamper = () => {
   const rand = rng(3);
   const g = new Gen();
@@ -383,15 +451,16 @@ SC.tamper = () => {
   return g.ops;
 };
 
-function budgetOp(g, rand, nq, np) {
+function budgetOp(g, rand, nq, np, nt, rectBudget) {
   const list = [...g.ref.m.values()];
-  const rects = [], pts = [];
+  const rects = [], pts = [], tops = [];
+  for (let i = 0; i < (nt || 0); i++) { const o = list[Math.floor(rand() * list.length)]; tops.push(box(o.minX - 60, o.minY - 60, 120, 120)); }
   for (let i = 0; i < nq; i++) { const o = list[Math.floor(rand() * list.length)]; rects.push(box(o.minX - 10, o.minY - 10, 40, 40)); }
   for (let i = 0; i < np; i++) {
     if (rand() < 0.5) { const o = list[Math.floor(rand() * list.length)]; pts.push([o.minX + (o.maxX - o.minX) / 2, o.minY + (o.maxY - o.minY) / 2]); }
     else pts.push([rand() * 10000, rand() * 10000]);
   }
-  g.ops.push(['B', rects, pts]);
+  g.ops.push(['B', rects, pts, tops, 3, undefined, rectBudget]);
 }
 
 SC.perf = () => {
@@ -420,6 +489,20 @@ SC.perf = () => {
   return g.ops;
 };
 
+SC.perf_sorted = () => {
+  // shapes arrive in sweep order, the worst case for naive insertion heuristics and split rules
+  const rand = rng(909);
+  const g = new Gen();
+  for (let i = 0; i < 30000; i++) g.ins({ id: `w${i}`, ...box(i / 3 + rand(), rand() * 10000, 2 + rand() * 20, 2 + rand() * 20), z: Math.floor(rand() * 8) });
+  for (let i = 0; i < 20000; i++) g.ins({ id: `v${i}`, ...box(rand() * 10000, i / 2 + rand(), 2 + rand() * 20, 2 + rand() * 20), z: Math.floor(rand() * 8) });
+  g.S();
+  budgetOp(g, rand, 400, 100, 0, SORT_BUDGET);
+  for (let i = 0; i < 15000; i++) g.upd(`w${i * 2}`, box(10000 - i / 2, 10000 - i / 3, 2 + rand() * 20, 2 + rand() * 20));
+  g.S();
+  budgetOp(g, rand, 400, 100, 0, SORT_BUDGET);
+  return g.ops;
+};
+
 SC.perf_hit = () => {
   // stacked layers: hundreds of large shapes cover any point, so only z-aware pruning is cheap
   const rand = rng(77);
@@ -429,7 +512,8 @@ SC.perf_hit = () => {
   for (let i = 0; i < 30000; i++) g.ins({ id: `s${i}`, ...box(rand() * 10000, rand() * 10000, 2 + rand() * 20, 2 + rand() * 20), z: Math.floor(rand() * 400) });
   g.S();
   const pts = () => { const p = []; for (let i = 0; i < 300; i++) p.push([rand() * 10000, rand() * 10000]); return p; };
-  g.ops.push(['B', [], pts()]);
+  const tpts = () => { const p = []; for (let i = 0; i < 150; i++) p.push(box(rand() * 10000, rand() * 10000, 100, 100)); return p; };
+  g.ops.push(['B', [], pts(), tpts(), 3]);
   for (let i = 0; i < 12000; i++) {
     const r = rand();
     if (r < 0.4) g.upd(`L${Math.floor(rand() * 8000)}`, big());
@@ -439,7 +523,7 @@ SC.perf_hit = () => {
   for (let i = 0; i < 3000; i++) { const id = `L${Math.floor(rand() * 8000)}`; if (g.ref.m.has(id)) g.rm(id); }
   for (let i = 0; i < 3000; i++) g.ins({ id: `N${i}`, ...big(), z: Math.floor(rand() * 400) });
   g.S();
-  g.ops.push(['B', [], pts()]);
+  g.ops.push(['B', [], pts(), tpts(), 3]);
   return g.ops;
 };
 
@@ -531,6 +615,27 @@ function listMatches(got, exp, what) {
   for (let i = 0; i < exp.length; i++) assert(rowKey(got[i]) === key(exp[i]).split('|').join('|'), `${what}: result ${i} is ${got[i]}, expected ${key(exp[i])}`);
 }
 
+function expTop(ref, rect, k) {
+  return ref.query(rect).sort((a, b) => (better(a, b) ? -1 : 1)).slice(0, k);
+}
+
+function simulateTop(root, rect, k) {
+  let n = 0;
+  if (!root.bounds || !ov(root.bounds, rect)) return 0;
+  let heap = [{ t: root.top, node: root }];
+  let out = 0;
+  while (heap.length && out < k) {
+    let bi = 0;
+    for (let i = 1; i < heap.length; i++) if (better(heap[i].t, heap[bi].t)) bi = i;
+    const it = heap.splice(bi, 1)[0];
+    if (!it.node) { out++; continue; }
+    n++;
+    if (it.node.leaf) { for (const e of it.node.children) { n++; if (ov(e, rect)) heap.push({ t: e, node: null }); } }
+    else for (const c of it.node.children) if (ov(c.bounds, rect)) heap.push({ t: c.top, node: c });
+  }
+  return n;
+}
+
 function judge(ops, res) {
   let ref = new Ref();
   let snaps = {};
@@ -588,6 +693,8 @@ function judge(ops, res) {
         if (exp) assert(rowKey(r.v) === key(exp), `${at}: hitTest(${op[1]},${op[2]}) returned ${r.v}, expected ${key(exp)}`);
         break;
       }
+      case 'qt': listMatches(r.list, expTop(ref, op[1], op[2]), `${at}: queryTop ${JSON.stringify(op[1])} k=${op[2]}`); break;
+      case 'qtv': listMatches(r.list, expTop(snaps[op[1]], op[2], op[3]), `${at}: queryTop on snapshot ${op[1]}`); break;
       case 'S': checkStructure(r.dump, r.size, ref); break;
       case 'M': break;
       case 'T': {
@@ -601,9 +708,10 @@ function judge(ops, res) {
         for (let k = 0; k < op[1].length; k++) {
           const it = r.items[k];
           listMatches(it.list, ref.query(op[1][k]), `${at}: localized queryRect`);
-          assert(it.rep <= RECT_BUDGET, `${at}: queryRect reported ${it.rep} inspections (budget ${RECT_BUDGET})`);
+          const rb = op[6] || RECT_BUDGET;
+          assert(it.rep <= rb, `${at}: queryRect reported ${it.rep} inspections (budget ${rb})`);
           const sim = simulateRect(r.dump, op[1][k]);
-          assert(sim <= RECT_BUDGET, `${at}: a localized query needs ${sim} inspections on your tree (budget ${RECT_BUDGET}); the tree is badly shaped or its bounds are stale`);
+          assert(sim <= rb, `${at}: a localized query needs ${sim} inspections on your tree (budget ${RECT_BUDGET}); the tree is badly shaped or its bounds are stale`);
         }
         for (let k = 0; k < op[2].length; k++) {
           const [x, y] = op[2][k];
@@ -613,6 +721,14 @@ function judge(ops, res) {
           assert(r.hits[k].rep <= HIT_BUDGET, `${at}: hitTest reported ${r.hits[k].rep} inspections (budget ${HIT_BUDGET})`);
           const sim = simulateHit(r.dump, x, y);
           assert(sim <= HIT_BUDGET, `${at}: a hit test needs ${sim} inspections on your tree (budget ${HIT_BUDGET}); is node.top used to prune?`);
+        }
+        const tb = op[5] || TOP_BUDGET;
+        for (let k = 0; k < (op[3] || []).length; k++) {
+          const t = r.tops[k];
+          listMatches(t.list, expTop(ref, op[3][k], op[4]), `${at}: queryTop`);
+          assert(t.rep <= tb, `${at}: queryTop reported ${t.rep} inspections (budget ${tb})`);
+          const sim = simulateTop(r.dump, op[3][k], op[4]);
+          assert(sim <= tb, `${at}: queryTop needs ${sim} inspections on your tree (budget ${tb})`);
         }
         break;
       }
