@@ -500,7 +500,8 @@ def _amount(rng, lo, hi):
 
 
 def _rate(rng, lo=4000000, hi=9000000):
-    return f"0.{rng.randrange(lo, hi):08d}"
+    """A fixed rate as the desk books it, to six decimal places (lo and hi in units of 1e-8)."""
+    return f"0.{rng.randrange(lo // 100, hi // 100):06d}"
 
 
 def _spread(rng):
