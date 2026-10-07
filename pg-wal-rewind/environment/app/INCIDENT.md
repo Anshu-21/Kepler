@@ -65,7 +65,7 @@ Each value is the column's text output in a session with `TimeZone = 'UTC'`, `Da
 | `bool` | `"true"`, `"false"` |
 | `text`, `varchar` | the string itself |
 | `numeric` | `"1250.50"`, `"-0.000120"`, `"NaN"` (always the stored display scale, never an exponent) |
-| `float8` | `"0.1"`, `"1e+15"`, `"-2.5e-07"`, `"NaN"`, `"-Infinity"` |
+| `float8` | `"0.1"`, `"1e+15"`, `"-2.5e-07"`, `"-5.5756665098698096e+16"`, `"NaN"`, `"-Infinity"` (the output of `src/common/d2s.c` as PostgreSQL builds it, which is not always the same as Python's `repr`: that value's `repr` is `-5.57566650986981e+16`) |
 | `timestamptz` | `"2026-03-04 05:06:07.25+00"`, `"2026-03-04 05:06:07+00"` |
 | `date` | `"2026-03-04"` |
 | `interval` | `"-1 years -2 mons +3 days -04:05:06.789"`, `"36:00:00"` |
