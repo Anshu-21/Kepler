@@ -97,6 +97,9 @@ for contract, want in pairs:
         if F(p["reserve_topup"]) > 0 and any(F(r["swept"]) > 0 for r in p["tranches"].values()):
             circular += 1
 assert off_ceil >= 100 and off_round >= 20 and circular >= 5, (off_ceil, off_round, circular)
+import json, os
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sealed.json"), "w") as handle:
+    json.dump(pairs, handle, separators=(",", ":"))
 print("sealed contracts ok", digest, f"closest rounding {float(audit.closest):.3g}",
       f"gross-ups off ceil {off_ceil}, off round {off_round}, top-ups against a sweep {circular}",
       f"cutoff flips local {flip_local} fixed {flip_fixed} exact {flip_edge}, ICMA spans {icma_span}")

@@ -1,7 +1,17 @@
 import json, os, re, subprocess, tempfile
 from pathlib import Path
 
-from cases import cases
+from cases import DIGEST, cases, digest
+
+
+def sealed():
+    """The pairs build_check.py saved at image build time, regenerated only if they are missing."""
+    saved = Path(__file__).with_name("sealed.json")
+    if saved.is_file():
+        pairs = [tuple(pair) for pair in json.loads(saved.read_text())]
+        assert digest(pairs) == DIGEST, "sealed contracts changed since the build"
+        return pairs
+    return cases()
 
 MONEY = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{2}$")
 PERIOD_KEYS = {"number", "accrual_start", "accrual_end", "payment_date", "determination_date", "collections", "fee_paid",
@@ -52,7 +62,7 @@ def test_settlement_statements():
     original = engine.read_bytes()
     with tempfile.TemporaryDirectory(prefix="settle-") as name:
         folder = Path(name)
-        for i, (contract, expected) in enumerate(cases()):
+        for i, (contract, expected) in enumerate(sealed()):
             first = run_candidate(contract, folder, f"c{i}a")
             second = run_candidate(contract, folder, f"c{i}b")
             assert first == second, f"{contract['contract_id']} differs between runs"
