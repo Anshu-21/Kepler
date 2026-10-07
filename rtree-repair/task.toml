@@ -1,0 +1,37 @@
+artifacts = ["/app/src/rtree.js"]
+
+[task]
+name = "afterquery/rtree-repair"
+
+[metadata]
+author_name = "Anshu Kumar"
+author_email = "kumaranshu303393@gmail.com"
+difficulty_explanation = """The agent inherits a ~250 line JavaScript R-tree that looks plausible and mostly works on small random scenes, but carries several interacting defects, each of which only shows under particular geometry or operation order:
+- the node split drops a child when the two halves overlap (clustered and nested scenes), but is clean on grids where a zero-overlap cut exists;
+- remove() collects orphans from an underfull internal node without flattening the subtree, so whole branches are reinserted as if they were shapes, and it only refreshes the leaf's bounds so ancestors keep stale boxes and never get shrunk;
+- the empty/one-child root is not collapsed, which breaks the root invariants;
+- update() leaves the id table pointing at the old entry, so a later remove() deletes the wrong object or none;
+- subtree choice uses `||` where it needs a tie-break, which gives a valid but badly overlapping tree that passes every correctness test and fails only the inspection budget;
+- the Y-axis intersection test is closed instead of half-open, and ids are ordered by localeCompare rather than code units, which only matter on touching edges and mixed-case ids.
+Fixing the obvious crash is not enough: the verifier replays sequences on grid, cluster, diagonal and nested scenes, zero-area shapes, repeated long-distance moves and full drain/refill cycles, and after each phase checks both results against a brute-force scan and the exact structural invariants (exact minimum bounding rectangles, fill bounds, uniform leaf depth, each shape exactly once). Then a 50,000 shape scene is churned with 40,000 structural operations and localized queries must stay under a fixed inspection budget on the agent's own tree, which only a tree whose bounds are tight and whose insertion and split heuristics are sensible can meet. The hard part for an agent is that failures are data dependent: a fix that passes small random tests still fails on clusters or after many deletions, so it must reason about the invariants of the whole condense/reinsert path rather than patching the symptom it sees."""
+solution_explanation = """Rewrite the weak operations around the invariant that every node's bounds are recomputed from its children whenever they change. Insert descends by least enlargement then smallest area, then walks the path back up recomputing bounds and splitting overfull nodes; the split tries four axis/edge sorts and every legal cut point, choosing the minimum overlap then minimum total area, and the root grows when it splits. Remove locates the entry through the id table and bounds containment, removes it, walks up removing underfull non-root nodes from their parent (collecting every entry beneath them) and recomputing bounds on every ancestor, collapses a root with one child, and reinserts the orphans as entries. Update validates, removes, and inserts a fresh entry while updating the id table. Predicates use the half-open formulas and ids use code unit comparison. Reference run: every scenario passes in about 7 seconds and the worst localized query on 50,000 shapes inspects 86 nodes plus entries against a budget of 400."""
+verification_explanation = """tests/harness.js is run per scenario in a separate unprivileged node process on a copy of the agent's rtree.js, driven by seeded pseudo random generators so results are deterministic. A reference Map of live shapes is the ground truth: after phases of operations the verifier compares queryRect results (exact list, order and values) and hitTest results (including z ties and edge points) against a full scan, with rectangles and points chosen to sit exactly on shape edges. checkStructure walks root.children and asserts exact minimum bounding rectangles, capacity and minimum fill, internal root arity, uniform leaf depth, null bounds on an empty root, every id exactly once with current bounds and z, and size. Scenarios: contract details (half-open edges, code unit id order, z default, error behavior, copies), the operation sequences from the brief on many scenes plus equivalence with a fresh rebuild, four adversarial distributions with churn and spatial-order deletion, repeated long distance moves, drain/refill cycles, a tamper probe that removes an entry from its leaf and requires the answer to change (so results must come from the tree rather than a side array), and a 50,000 shape scene with 40,000 operations followed by 400 localized queries and hit tests. The budget (400 inspections) is applied both to the counters the tree reports and to a count the verifier recomputes by descending the agent's own tree, and Map iteration over the scene is trapped during queries. No timing is used. Checked: the reference passes all ten tests, the shipped starter fails nine, a reference with only stale ancestor bounds fails structure, one with only the bad subtree choice fails the budget (4875 inspections), and brute-force variants fail the budget trap or the tamper probe. pytest runs under pytest-json-ctrf and test.sh writes 1 only if all tests pass."""
+category = "Software"
+subcategory = "Frontend"
+tags = ["r-tree", "spatial-index", "debugging", "javascript", "canvas"]
+expert_time_estimate_hours = 4
+relevant_experience = "I build browser and Node.js tooling in JavaScript, including canvas-based editors, and I have debugged hierarchical data structures with cached aggregate state (bounding boxes, subtree sizes) where updates failed to propagate. I wrote the reference tree, the seeded adversarial scene generators and the structural checker for this task."
+
+[verifier]
+timeout_sec = 900.0
+environment_mode = "separate"
+
+[agent]
+timeout_sec = 9000.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
