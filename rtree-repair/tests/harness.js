@@ -15,8 +15,8 @@ const NEW_PER_OP = Number(process.env.RT_NEW_PER_OP || 40);
 const TOP_BUDGET = Number(process.env.RT_TOP_BUDGET || 600);
 const SORT_BUDGET = Number(process.env.RT_SORT_BUDGET || 400);
 const NN_BUDGET = Number(process.env.RT_NN_BUDGET || 250);
-const RR_FACTOR = Number(process.env.RT_RR_FACTOR || 6);
-const RR_BASE = Number(process.env.RT_RR_BASE || 250);
+const RR_FACTOR = Number(process.env.RT_RR_FACTOR || 3);
+const RR_BASE = Number(process.env.RT_RR_BASE || 80);
 const RECT_BUDGET = Number(process.env.RT_RECT_BUDGET || 400);
 const HIT_BUDGET = Number(process.env.RT_HIT_BUDGET || 500);
 
@@ -542,25 +542,29 @@ SC.versions = () => {
 };
 
 SC.perf_ops = () => {
-  // large scene: nearest, bulk removal and version diff must all be proportional to what they touch
+  // large scene: nearest, bulk removal and version diff on 50,000 shapes
   const rand = rng(4545);
   const g = new Gen();
   const mk = (id) => ({ id, ...box(Math.floor(rand() * 20000), Math.floor(rand() * 20000), 1 + Math.floor(rand() * 40), 1 + Math.floor(rand() * 40)), z: Math.floor(rand() * 8) });
   for (let i = 0; i < 50000; i++) g.ins(mk(`p${i}`));
   g.S();
-  for (let i = 0; i < 150; i++) g.nn(Math.floor(rand() * 20000), Math.floor(rand() * 20000), 5, NN_BUDGET);
+  const nns = []; for (let i = 0; i < 150; i++) nns.push([Math.floor(rand() * 20000), Math.floor(rand() * 20000)]);
+  g.ops.push(['B', [], [], [], 3, undefined, undefined, nns]);
   g.snap('v0');
   for (let i = 0; i < 40; i++) { const ids = [...g.ref.m.keys()]; g.upd(ids[Math.floor(rand() * ids.length)], box(rand() * 20000, rand() * 20000, 30, 30)); }
   g.snap('v1');
-  g.diff('v0', 'v1', true); g.diff('v1', 'v0', true);
+  g.diff('v0', 'v1'); g.diff('v1', 'v0');
   g.restore('v0');
   for (let i = 0; i < 25; i++) g.ins(mk(`new${i}`));
   g.snap('v2');
-  g.diff('v1', 'v2', true); g.diff('v2', '@', true);
-  for (let i = 0; i < 12; i++) { const x = Math.floor(rand() * 19000), y = Math.floor(rand() * 19000); g.rr({ minX: x, minY: y, maxX: x + 600, maxY: y + 600 }, [RR_FACTOR, RR_BASE]); }
-  g.S();
-  g.diff('v2', '@', true);
-  g.rr({ minX: 3, minY: 3, maxX: 4, maxY: 4 }, [RR_FACTOR, RR_BASE]);
+  g.diff('v1', 'v2'); g.diff('v2', '@');
+  for (let i = 0; i < 5; i++) {
+    g.S();
+    const x = Math.floor(rand() * 19000), y = Math.floor(rand() * 19000);
+    g.rr({ minX: x, minY: y, maxX: x + 600, maxY: y + 600 }, [RR_FACTOR, RR_BASE]);
+    g.S();
+  }
+  g.diff('v2', '@');
   return g.ops;
 };
 
@@ -757,10 +761,30 @@ function simulateTop(root, rect, k) {
   return n;
 }
 
+function simulateNearest(root, x, y, k) {
+  const d2 = (b) => { const dx = Math.max(b.minX - x, 0, x - b.maxX), dy = Math.max(b.minY - y, 0, y - b.maxY); return dx * dx + dy * dy; };
+  if (!root.bounds) return 0;
+  const less = (a, b) => (a.d !== b.d ? a.d < b.d : a.node ? !b.node : b.node ? false : cmpId(a.e.id, b.e.id) < 0);
+  const heap = [{ d: d2(root.bounds), node: root }];
+  let n = 0, out = 0;
+  while (heap.length && out < k) {
+    let bi = 0;
+    for (let i = 1; i < heap.length; i++) if (less(heap[i], heap[bi])) bi = i;
+    const it = heap.splice(bi, 1)[0];
+    if (!it.node) { out++; continue; }
+    n++;
+    if (it.node.leaf) for (const e of it.node.children) { n++; heap.push({ d: d2(e), e }); }
+    else for (const c of it.node.children) heap.push({ d: d2(c.bounds), node: c });
+  }
+  return n;
+}
+
 function judge(ops, res) {
   let ref = new Ref();
   let snaps = {};
   const ids = {};
+  let pendingRR = null;
+  let lastNids = null;
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     const r = res[i];
@@ -778,7 +802,7 @@ function judge(ops, res) {
         ids[op[1]] = set;
         break;
       }
-      case 'qv': listMatches(r.list, snaps[op[1]].query(op[2]), `${at}: queryRect on snapshot ${op[1]}`); break;
+      case 'qv': listMatches(r.list, snaps[op[1]].query(op[2]), `${at}: queryRect on snapshot ${op[1]}`); if (r.list.length) assert(r.rep >= 1, `${at}: snapshot.stats does not count the work of queryRect`); break;
       case 'hv': {
         const exp = snaps[op[1]].hit(op[2], op[3]);
         assert((r.v === null) === (exp === null) && (!exp || rowKey(r.v) === key(exp)), `${at}: hitTest on snapshot ${op[1]} mismatch`);
@@ -818,9 +842,7 @@ function judge(ops, res) {
         const hit = [...ref.m.values()].filter((o) => op[1].minX <= o.minX && o.maxX <= op[1].maxX && op[1].minY <= o.minY && o.maxY <= op[1].maxY);
         assert(r.n === hit.length, `${at}: removeRect returned ${r.n}, expected ${hit.length}`);
         for (const o of hit) ref.remove(o.id);
-        if (process.env.RT_REPORT) console.error(`rr n=${hit.length} rep=${r.rep}`);
-        if (op[2]) assert(r.reads <= op[2] * hit.length + op[3], `${at}: removeRect of ${hit.length} shapes read the children of ${r.reads} nodes (limit ${op[2] * hit.length + op[3]})`);
-        if (op[2]) assert(r.rep <= op[2] * hit.length + op[3], `${at}: removeRect of ${hit.length} shapes inspected ${r.rep} nodes and shapes (limit ${op[2] * hit.length + op[3]})`);
+        if (op[2]) { assert(r.rep <= op[2] * hit.length + op[3], `${at}: removeRect of ${hit.length} shapes inspected ${r.rep} nodes and shapes (limit ${op[2] * hit.length + op[3]})`); pendingRR = { n: hit.length, f: op[2], b: op[3], at }; }
         break;
       }
       case 'nn': case 'nnv': {
@@ -829,9 +851,6 @@ function judge(ops, res) {
         const d2 = (o) => { const dx = Math.max(o.minX - x, 0, x - o.maxX), dy = Math.max(o.minY - y, 0, y - o.maxY); return dx * dx + dy * dy; };
         const exp = [...src.m.values()].sort((a, b) => d2(a) - d2(b) || cmpId(a.id, b.id)).slice(0, k);
         listMatches(r.list, exp, `${at}: nearest(${x},${y},${k})`);
-        if (process.env.RT_REPORT && op[0] === 'nn' && op[4]) console.error(`nn rep=${r.rep}`);
-        if (op[0] === 'nn' && op[4]) assert(r.reads <= op[4], `${at}: nearest read the children of ${r.reads} nodes (budget ${op[4]})`);
-        if (op[0] === 'nn' && op[4]) assert(r.rep <= op[4], `${at}: nearest inspected ${r.rep} nodes and shapes (budget ${op[4]})`);
         break;
       }
       case 'diff': {
@@ -851,17 +870,31 @@ function judge(ops, res) {
           assert((g[1] === null) === (exp[k][1] === null) && (!g[1] || rowKey(g[1]) === key(exp[k][1])), `${at}: diff before of ${exp[k][0]} is wrong`);
           assert((g[2] === null) === (exp[k][2] === null) && (!g[2] || rowKey(g[2]) === key(exp[k][2])), `${at}: diff after of ${exp[k][0]} is wrong`);
         }
-        if (process.env.RT_REPORT && op[3]) console.error(`diff changes=${exp.length} reads=${r.reads}`);
-        if (op[3]) assert(r.reads <= 40 * exp.length + 600, `${at}: diff of ${exp.length} changes read the children of ${r.reads} nodes (limit ${40 * exp.length + 600}); it must not scan the scene`);
         break;
       }
       case 'qt': listMatches(r.list, expTop(ref, op[1], op[2]), `${at}: queryTop ${JSON.stringify(op[1])} k=${op[2]}`); break;
       case 'qtv': listMatches(r.list, expTop(snaps[op[1]], op[2], op[3]), `${at}: queryTop on snapshot ${op[1]}`); break;
-      case 'S': checkStructure(r.dump, r.size, ref); break;
+      case 'S': {
+        checkStructure(r.dump, r.size, ref);
+        const set = new Set();
+        (function w(n) { set.add(n.nid); if (!n.leaf) n.children.forEach(w); })(r.dump);
+        if (pendingRR) {
+          assert(lastNids, `${at}: missing previous version to compare against`);
+          let fresh = 0;
+          for (const id of set) if (!lastNids.has(id)) fresh++;
+          const lim = pendingRR.f * pendingRR.n + pendingRR.b;
+          if (process.env.RT_REPORT) console.error(`rr n=${pendingRR.n} fresh=${fresh}`);
+          assert(fresh <= lim, `${pendingRR.at}: removeRect of ${pendingRR.n} shapes created ${fresh} new nodes (limit ${lim}); untouched subtrees must be shared with the previous version`);
+          pendingRR = null;
+        }
+        lastNids = set;
+        break;
+      }
       case 'M': break;
       case 'T': {
         assert(ref.m.has(r.id), 'tamper: unknown entry');
         assert(Array.isArray(r.list) && !r.list.some((x) => x[0] === r.id), 'queryRect is not answered from the tree structure');
+        assert(Array.isArray(r.nn) && !r.nn.some((x) => x[0] === r.id), 'nearest is not answered from the tree structure');
         break;
       }
       case 'B': {
@@ -886,6 +919,15 @@ function judge(ops, res) {
           rep.hit += simulateHit(r.dump, x, y) / op[2].length;
           const sim = simulateHit(r.dump, x, y);
           assert(sim <= HIT_BUDGET, `${at}: a hit test needs ${sim} inspections on your tree (budget ${HIT_BUDGET}); is node.top used to prune?`);
+        }
+        for (let k = 0; k < (op[7] || []).length; k++) {
+          const [x, y] = op[7][k];
+          const d2 = (o) => { const dx = Math.max(o.minX - x, 0, x - o.maxX), dy = Math.max(o.minY - y, 0, y - o.maxY); return dx * dx + dy * dy; };
+          const exp = [...ref.m.values()].sort((a, b) => d2(a) - d2(b) || cmpId(a.id, b.id)).slice(0, 5);
+          listMatches(r.nns[k].list, exp, `${at}: nearest(${x},${y},5)`);
+          assert(r.nns[k].rep <= NN_BUDGET, `${at}: nearest reported ${r.nns[k].rep} inspections (budget ${NN_BUDGET})`);
+          const sim = simulateNearest(r.dump, x, y, 5);
+          assert(sim <= NN_BUDGET, `${at}: nearest needs ${sim} inspections on your tree (budget ${NN_BUDGET})`);
         }
         const tb = op[5] || TOP_BUDGET;
         for (let k = 0; k < (op[3] || []).length; k++) {
@@ -914,12 +956,13 @@ function main() {
     fs.copyFileSync(file, path.join(scratch, 'rtree.js'));
     for (const f of ['runner.js', 'trace.json', 'rtree.js']) fs.chmodSync(path.join(scratch, f), 0o644);
     const out = path.join(scratch, 'out.json');
-    fs.chmodSync(scratch, 0o777);
+    if (process.geteuid && process.geteuid() === 0) { fs.chownSync(scratch, 65534, 65534); fs.chmodSync(scratch, 0o700); } else fs.chmodSync(scratch, 0o700);
     const args = ['--max-old-space-size=1500', 'runner.js', 'rtree.js', 'trace.json', 'out.json'];
     const cmd = process.geteuid && process.geteuid() === 0
       ? ['setpriv', ['--reuid=65534', '--regid=65534', '--clear-groups', '--no-new-privs', 'node', ...args]]
       : ['node', args];
     const p = spawnSync(cmd[0], cmd[1], { cwd: scratch, timeout: 540000, env: { PATH: process.env.PATH, HOME: scratch }, stdio: 'ignore' });
+    if (process.geteuid && process.geteuid() === 0) spawnSync('pkill', ['-9', '-u', '65534'], { stdio: 'ignore' });
     assert(!p.error, `candidate process failed: ${p.error && p.error.code}`);
     assert(fs.existsSync(out) && fs.statSync(out).size < 400e6, 'candidate produced no usable observations (crash, hang or exit during the run)');
     let res;

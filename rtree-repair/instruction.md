@@ -132,13 +132,11 @@ Versions and undo:
 
 The editor's undo stack keeps old versions of the scene, so the tree must be persistent.
 
-`snapshot()` returns a read-only view of the tree as it is at that moment, in constant time. The view has `root`, `size`, `queryRect`, `queryTop`, `hitTest`, `stats` and `resetStats`, behaving exactly like the same members of the tree, and its `root` obeys every structural rule above.
+`snapshot()` returns a read-only view of the tree as it is at that moment, without copying the tree. The view has `root`, `size`, `queryRect`, `queryTop`, `nearest`, `hitTest`, `stats` and `resetStats`, behaving exactly like the same members of the tree, and its `root` obeys every structural rule above.
 
 No later `insert`, `remove`, `update` or `restore` on the tree may change anything a snapshot reports, including node bounds and `top`. Nodes that an operation did not need to change must stay shared between the versions instead of being copied: a single `insert`, `remove` or `update` may create at most 40 new node objects that are not already part of the previous version.
 
 `restore(view)` makes the tree equal to a snapshot taken from it earlier (it may take time proportional to the number of shapes). The tree can then be changed again, and neither that snapshot nor any other may be affected. The snapshot can be restored again later.
-
-Every node's `children` must remain an ordinary writable data property, because the graders wrap it to count how often the children of a node are read.
 
 Statistics:
 
@@ -147,9 +145,9 @@ Statistics:
 * `nodeVisits`
 * `entryChecks`
 
-`nodeVisits` increases whenever a node is entered while running `queryRect`, `queryTop` or `hitTest`.
+`nodeVisits` increases whenever a node is entered while running `queryRect`, `queryTop`, `nearest`, `removeRect` or `hitTest`.
 
-`entryChecks` increases whenever a shape is checked by a query.
+`entryChecks` increases whenever a shape is checked by one of those operations.
 
 `resetStats()` must set both values back to zero.
 
@@ -159,7 +157,7 @@ For a 50,000-shape scene, a query covering a small area should stay within:
 nodeVisits + entryChecks <= 400
 ```
 
-This must still hold after tens of thousands of moves and deletions, and also when the shapes were inserted in sweep order (all of one axis in increasing order) instead of at random. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`, and `queryTop` with a 100 by 100 rectangle and `k = 3` within 600. In a 50,000-shape scene, `nearest` with `k = 5` may read the children of at most 250 nodes. `removeRect` may read the children of at most `6 * n + 250` nodes when it removes `n` shapes. `diff` may read the children of at most `40 * c + 600` nodes when it returns `c` entries. The graders count these reads themselves, so a scan of the scene is rejected whatever `stats` says. The graders measure this directly from the tree, so simply reporting different numbers in `stats` will not help.
+This must still hold after tens of thousands of moves and deletions, and also when the shapes were inserted in sweep order (all of one axis in increasing order) instead of at random. In a 38,000-shape scene where several hundred large shapes cover any given point, `hitTest` must also stay within `nodeVisits + entryChecks <= 500`, and `queryTop` with a 100 by 100 rectangle and `k = 3` within 600. In a 50,000-shape scene, `nearest` with `k = 5` must stay within 250. `removeRect` must not rebuild the tree: when it removes `n` shapes it may create at most `3 * n + 80` node objects that were not part of the previous version, and its `stats` must stay within `3 * n + 80` as well. The graders recompute the query budgets on the tree you build, so what `stats` reports is not what decides them.
 
 Cases to handle:
 

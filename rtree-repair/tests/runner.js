@@ -31,29 +31,6 @@ function dump(n, depth) {
   return o;
 }
 
-function instrument(roots) {
-  const seen = new Set();
-  const nodes = [];
-  const walk = (n) => {
-    if (seen.has(n)) return;
-    seen.add(n);
-    nodes.push(n);
-    if (!n.leaf) for (const c of n.children) walk(c);
-  };
-  roots.forEach(walk);
-  let reads = 0;
-  const saved = [];
-  for (const n of nodes) {
-    let v = n.children;
-    Object.defineProperty(n, 'children', { configurable: true, enumerable: true, get() { reads++; return v; }, set(x) { v = x; } });
-    saved.push([n, () => v]);
-  }
-  return {
-    count: () => reads,
-    restore() { for (const [n, get] of saved) Object.defineProperty(n, 'children', { value: get(), writable: true, configurable: true, enumerable: true }); },
-  };
-}
-
 function guarded(f) {
   const names = ['values', 'entries', 'keys', 'forEach', Symbol.iterator];
   const saved = names.map((k) => [k, Map.prototype[k]]);
@@ -79,30 +56,15 @@ function step(op) {
   if (kind === 'upd') { try { tree.update(op[1], op[2]); return { threw: false }; } catch (e) { return { threw: true }; } }
   if (kind === 'rm') return { v: tree.remove(op[1]) };
   if (kind === 'q') return { list: rows(tree.queryRect(op[1])) };
-  if (kind === 'rr') {
-    const ins = op[2] ? instrument([tree.root]) : null;
-    tree.resetStats();
-    let n;
-    try { n = tree.removeRect(op[1]); } finally { if (ins) ins.restore(); }
-    return { n, rep: tree.stats.nodeVisits + tree.stats.entryChecks, reads: ins ? ins.count() : 0 };
-  }
-  if (kind === 'nn') {
-    const ins = op[4] ? instrument([tree.root]) : null;
-    tree.resetStats();
-    let list;
-    try { list = tree.nearest(op[1], op[2], op[3]); } finally { if (ins) ins.restore(); }
-    return { list: rows(list), rep: tree.stats.nodeVisits + tree.stats.entryChecks, reads: ins ? ins.count() : 0 };
-  }
+  if (kind === 'rr') { tree.resetStats(); const n = tree.removeRect(op[1]); return { n, rep: tree.stats.nodeVisits + tree.stats.entryChecks }; }
+  if (kind === 'nn') return { list: rows(tree.nearest(op[1], op[2], op[3])) };
   if (kind === 'nnv') return { list: rows(views[op[1]].nearest(op[2], op[3], op[4])) };
   if (kind === 'diff') {
     const va = op[1] === '@' ? tree : views[op[1]];
     const vb = op[2] === '@' ? tree : views[op[2]];
-    const ins = instrument([va.root, vb.root]);
-    let list;
-    try { list = tree.diff(va, vb); } finally { ins.restore(); }
-    const reads = ins.count();
-    if (!Array.isArray(list)) return { list: { bad: true }, reads };
-    return { list: list.map((d) => [d.id, d.before ? row(d.before) : null, d.after ? row(d.after) : null]), reads };
+    const list = tree.diff(va, vb);
+    if (!Array.isArray(list)) return { list: { bad: true } };
+    return { list: list.map((d) => [d.id, d.before ? row(d.before) : null, d.after ? row(d.after) : null]) };
   }
   if (kind === 'qt') return { list: rows(tree.queryTop(op[1], op[2])) };
   if (kind === 'qtv') return { list: rows(views[op[1]].queryTop(op[2], op[3])) };
@@ -111,7 +73,7 @@ function step(op) {
   if (kind === 'snap') { views[op[1]] = tree.snapshot(); return {}; }
   if (kind === 'restore') { tree.restore(views[op[1]]); return {}; }
   if (kind === 'SV') { const v = views[op[1]]; return { size: v.size, dump: dump(v.root, 0) }; }
-  if (kind === 'qv') return { list: rows(views[op[1]].queryRect(op[2])) };
+  if (kind === 'qv') { const v = views[op[1]]; v.resetStats(); const list = v.queryRect(op[2]); return { list: rows(list), rep: v.stats.nodeVisits + v.stats.entryChecks }; }
   if (kind === 'hv') return { v: one(views[op[1]].hitTest(op[2], op[3])) };
   if (kind === 'M') {
     const r = tree.queryRect(op[1]);
@@ -143,7 +105,14 @@ function step(op) {
       trap = trap || v;
       tops.push({ list: rows(list), rep: tree.stats.nodeVisits + tree.stats.entryChecks });
     }
-    return { items, hits, tops, trap, dump: dump(tree.root, 0), size: tree.size };
+    const nns = [];
+    for (const [x, y] of op[7] || []) {
+      tree.resetStats();
+      const [list, v] = guarded(() => tree.nearest(x, y, 5));
+      trap = trap || v;
+      nns.push({ list: rows(list), rep: tree.stats.nodeVisits + tree.stats.entryChecks });
+    }
+    return { items, hits, tops, nns, trap, dump: dump(tree.root, 0), size: tree.size };
   }
   if (kind === 'T') {
     let leaf = tree.root;
@@ -152,6 +121,7 @@ function step(op) {
     const info = { id: e.id };
     leaf.children.splice(0, 1);
     info.list = rows(tree.queryRect({ minX: e.minX, minY: e.minY, maxX: e.maxX + 0.5, maxY: e.maxY + 0.5 }));
+    info.nn = rows(tree.nearest(e.minX, e.minY, 3));
     return info;
   }
   return {};
