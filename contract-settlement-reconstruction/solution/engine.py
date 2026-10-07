@@ -195,28 +195,24 @@ class BookingLog:
 
 
 class Knowledge:
-    """Rate changes and fixings as known on one determination date."""
+    """Fixings as currently known, with a version per period so caches never serve a stale fixing."""
 
-    def __init__(self, contract, live, base_fixings, rate_cal):
-        self.live = live
+    def __init__(self, base_fixings, rate_cal, schedule):
         self.base = base_fixings
-        self.corrections = {date.fromisoformat(r["fixing_date"]): Decimal(r["fixing"]) / 100
-                            for r in live.values() if r["kind"] == "FIXING_CORRECTION"}
-        self.changes = {}
-        for r in live.values():
-            if r["kind"] == "RATE_CHANGE":
-                self.changes.setdefault(r["tranche_id"], []).append(r)
+        self.corrections = {}
         self.rate_cal = rate_cal
+        self.version = [0] * len(schedule)
         self.cache = {}
 
     def fixing(self, day):
         hit = self.corrections.get(day)
         return hit if hit is not None else self.base[day]
 
-    def compounded(self, a, b, lookback, end, lockout):
+    def compounded(self, a, b, lookback, end, lockout, version):
         """Segment [a, b) of a period ending at end; lockout days count back from end, not b."""
-        key = (a, b, lookback, end, lockout)
-        if key not in self.cache:
+        key = (a, b, lookback, end, lockout, version)
+        hit = self.cache.get(key)
+        if hit is None:
             cal, factor, day = self.rate_cal, Decimal(1), a
             locked = cal.previous(end, lockout) if lockout else None
             while day < b:
@@ -229,49 +225,39 @@ class Knowledge:
                     base = cal.previous(locked, 1)
                 factor *= 1 + self.fixing(cal.previous(base, lookback)) * run / 360
             rate = (factor - 1) * 360 / (b - a).days
-            self.cache[key] = rate.quantize(RATE_STEP, rounding=ROUND_HALF_UP)
-        return self.cache[key]
+            hit = self.cache[key] = rate.quantize(RATE_STEP, rounding=ROUND_HALF_UP)
+        return hit
 
 
-def accrue(prepayments, know, tranche, period, opening, termination, margin, regular):
-    """Interest of one tranche over one period; returns (interest, balance at accrual end)."""
-    tid, terms = tranche["tranche_id"], tranche["rate"]
+def accrue(prepayments, know, tranche, period, opening, termination, margin, regular, level, inside, version):
+    """Interest of one tranche over one period from a starting rate level and the known rate changes
+    strictly inside the period; returns (interest, balance at accrual end)."""
+    terms = tranche["rate"]
     start, end = period["start"], period["end"]
     floating = terms["type"] == "FLOATING"
     field = "spread" if floating else "annual_rate"
-    level = Decimal(terms[field])
-    breaks = []
-    for change in know.changes.get(tid, []):
-        eff = parse(change["effective_date"])
-        if eff <= start:
-            breaks.append((eff, change["logical_id"], "pre", change))
-        elif eff < end:
-            breaks.append((eff, change["logical_id"], "rate", change))
-    for pre in prepayments.get(tid, []):
+    breaks = [(parse(c["effective_date"]), c["logical_id"], "rate", c) for c in inside]
+    for pre in prepayments.get(tranche["tranche_id"], []):
         eff = parse(pre["effective_date"])
         if start < eff < end:
             breaks.append((eff, pre["logical_id"], "cash", pre))
     breaks.sort(key=lambda b: (b[0], b[1]))
-    for eff, _, what, change in breaks:
-        if what == "pre":
-            level = Decimal(change[field])
 
     def segment(a, b, bal, lvl):
         if a >= b or bal == 0:
             return ZERO
         if floating:
-            rate = max(know.compounded(a, b, int(terms["lookback_days"]), end, int(terms.get("lockout_days", 0))),
+            rate = max(know.compounded(a, b, int(terms["lookback_days"]), end, int(terms.get("lockout_days", 0)), version),
                        Decimal(terms["floor"])) + lvl + margin
         else:
             rate = lvl + margin
         return interest_amount(bal, rate, tranche["day_count"], a, b, termination, regular)
 
     balance, cursor, total = opening, start, ZERO
-    inside = [b for b in breaks if b[2] != "pre"]
-    for day in sorted({b[0] for b in inside}):
+    for day in sorted({b[0] for b in breaks}):
         total += segment(cursor, day, balance, level)
         cursor = day
-        for eff, _, what, record in inside:
+        for eff, _, what, record in breaks:
             if eff != day:
                 continue
             if what == "cash":
@@ -282,55 +268,135 @@ def accrue(prepayments, know, tranche, period, opening, termination, margin, reg
     return total, balance
 
 
-class Restatement:
-    """Per-tranche period accruals, a stale set, and a running total.
+class LevelTrack:
+    """Accruals of one tranche at one constant rate level, for periods with no rate change inside.
 
-    A changed rate change makes its tranche stale from the period containing its
-    effective date onward, because a rate persists until superseded. A changed
-    fixing makes stale every floating period whose segments could look it up.
+    Entries are filled lazily (a skip pointer jumps over filled ones) and kept in a Fenwick tree,
+    so the sum over any stretch of periods is a logarithmic query once its entries exist.
     """
 
-    REACH = timedelta(days=40)  # lookback runs never reach further back than this
+    def __init__(self, size):
+        self.vals = [None] * size
+        self.tree = [ZERO] * (size + 1)
+        self.skip = list(range(size + 1))
 
-    def __init__(self, schedule, tranches):
+    def _next_missing(self, i):
+        root = i
+        while self.skip[root] != root:
+            root = self.skip[root]
+        while self.skip[i] != root:
+            self.skip[i], i = root, self.skip[i]
+        return root
+
+    def _add(self, i, delta):
+        i += 1
+        while i < len(self.tree):
+            self.tree[i] += delta
+            i += i & -i
+
+    def _prefix(self, i):
+        total = ZERO
+        while i > 0:
+            total += self.tree[i]
+            i -= i & -i
+        return total
+
+    def set(self, j, value):
+        old = self.vals[j]
+        self.vals[j] = value
+        self._add(j, value - (old or ZERO))
+        if old is None:
+            self.skip[j] = j + 1
+
+    def range_sum(self, a, b, compute):
+        j = self._next_missing(a)
+        while j < b:
+            self.set(j, compute(j))
+            j = self._next_missing(j)
+        return self._prefix(b) - self._prefix(a)
+
+
+class Restatement:
+    """Restated interest of earlier periods under what is known now.
+
+    A tranche's known rate changes cut its periods into stretches at one constant level; each stretch
+    is a range query on that level's track, and only the periods holding a change are accrued apart.
+    A rate change therefore costs nothing to restate beyond the stretches it reshapes, however many
+    earlier periods it reaches. A corrected fixing refreshes the few floating periods that can look
+    it up, at every level already accrued there.
+    """
+
+    REACH = timedelta(days=40)  # lookback and lockout runs never reach further back than this
+
+    def __init__(self, schedule, tranches, know, plain, special):
         self.ends = [p["end"] for p in schedule]
         self.starts = [p["start"] for p in schedule]
-        self.floating = [t["tranche_id"] for t in tranches if t["rate"]["type"] == "FLOATING"]
-        self.cache = {t["tranche_id"]: [] for t in tranches}
-        self.stale = {t["tranche_id"]: set() for t in tranches}
-        self.total = {t["tranche_id"]: ZERO for t in tranches}
+        self.size = len(schedule)
+        self.floating = {t["tranche_id"] for t in tranches if t["rate"]["type"] == "FLOATING"}
+        self.base = {t["tranche_id"]: Decimal(t["rate"]["spread" if t["rate"]["type"] == "FLOATING" else "annual_rate"])
+                     for t in tranches}
+        self.tracks = {t["tranche_id"]: {} for t in tranches}
+        self.know, self.plain, self.special = know, plain, special
+        self.memo = {}
+        self.settled = 0
 
-    def invalidate(self, changes):
-        for pair in changes:
-            for record in pair:
-                if record is None:
-                    continue
-                if record["kind"] == "RATE_CHANGE":
-                    tid = record["tranche_id"]
-                    cut = bisect.bisect_right(self.ends, parse(record["effective_date"]))
-                    self.stale[tid].update(range(cut, len(self.cache[tid])))
-                else:
+    def track(self, tid, level):
+        hit = self.tracks[tid].get(level)
+        if hit is None:
+            hit = self.tracks[tid][level] = LevelTrack(self.size)
+        return hit
+
+    def correct_fixings(self, records):
+        """Apply changed fixing corrections and refresh every accrued floating period they reach."""
+        touched = set()
+        for old, new in records:
+            for record in (old, new):
+                if record is not None:
                     day = parse(record["fixing_date"])
                     lo = bisect.bisect_right(self.ends, day)
                     hi = bisect.bisect_right(self.starts, day + self.REACH)
-                    for tid in self.floating:
-                        self.stale[tid].update(j for j in range(lo, hi) if j < len(self.cache[tid]))
+                    touched.update(range(lo, min(hi, self.settled)))
+            if old is not None:
+                self.know.corrections.pop(parse(old["fixing_date"]), None)
+        for old, new in records:
+            if new is not None:
+                self.know.corrections[parse(new["fixing_date"])] = Decimal(new["fixing"]) / 100
+        for j in touched:
+            self.know.version[j] += 1
+        for tid in self.floating:
+            for level, tr in self.tracks[tid].items():
+                for j in touched:
+                    if tr.vals[j] is not None:
+                        tr.set(j, self.plain(tid, j, level))
 
-    def refresh(self, tid, idx, compute):
-        """Bring periods 0..idx of one tranche up to date; return (restated before idx, current)."""
-        cache = self.cache[tid]
-        todo = self.stale[tid]
-        if len(cache) <= idx:
-            todo.update(range(len(cache), idx + 1))
-            cache.extend([None] * (idx + 1 - len(cache)))
-        for j in sorted(todo):
-            fresh = compute(j)
-            if cache[j] is not None:
-                self.total[tid] -= cache[j][0]
-            cache[j] = fresh
-            self.total[tid] += fresh[0]
-        todo.clear()
-        return self.total[tid] - cache[idx][0], cache[idx]
+    def restate(self, tid, idx, changes):
+        """(restated interest of periods before idx, (interest, balance after) of period idx)."""
+        groups = {}
+        for c in changes:
+            p = bisect.bisect_right(self.ends, parse(c["effective_date"]))
+            if p <= idx:
+                groups.setdefault(p, []).append(c)
+        level, cursor, total = self.base[tid], 0, ZERO
+        field = "spread" if tid in self.floating else "annual_rate"
+        for p in sorted(groups):
+            inside = sorted(groups[p], key=lambda c: (c["effective_date"], c["logical_id"]))
+            if p == idx:
+                break
+            total += self.track(tid, level).range_sum(cursor, p, lambda j, lv=level: self.plain(tid, j, lv))
+            key = (tid, p, level, tuple((c["effective_date"], c["logical_id"], c[field]) for c in inside),
+                   self.know.version[p])
+            hit = self.memo.get(key)
+            if hit is None:
+                hit = self.memo[key] = self.special(tid, p, level, inside)[0]
+            total += hit
+            level, cursor = Decimal(inside[-1][field]), p + 1
+        else:
+            inside = []
+        total += self.track(tid, level).range_sum(cursor, idx, lambda j, lv=level: self.plain(tid, j, lv))
+        current = self.special(tid, idx, level, inside)
+        if not inside:
+            self.track(tid, level).set(idx, current[0])
+        return total, current
 
 
 def pari_passu(cash, dues):
@@ -416,25 +482,41 @@ def reconcile(contract):
     base_fixings = {date.fromisoformat(d): Decimal(v) / 100 for d, v in contract["fixings"].items()}
     log = BookingLog(contract)
     rate_cal = Calendar(contract["rate_holidays"])
-    restate = Restatement(schedule, tranches)
+    know = Knowledge(base_fixings, rate_cal, schedule)
+    by_id = {t["tranche_id"]: t for t in tranches}
+    openings, margins = [], []
+
+    def special(tid, j, level, inside):
+        return accrue(prepayments, know, by_id[tid], schedule[j], openings[j][tid], termination, margins[j][tid],
+                      regular, level, inside, know.version[j])
+
+    def plain(tid, j, level):
+        return special(tid, j, level, ())[0]
+
+    restate = Restatement(schedule, tranches, know, plain, special)
 
     balance = {t["tranche_id"]: Decimal(t["opening_balance"]) for t in tranches}
     zero = lambda: {tid: ZERO for tid in ids}
     recognised, credit, deferred, arrears = zero(), zero(), zero(), zero()
     fee_arrears = ZERO
-    openings, margins, periods = [], [], []
+    periods = []
     for idx, period in enumerate(schedule):
         number = period["number"]
         final = number == len(schedule)
-        restate.invalidate(log.advance(cutoff(period["determination"])))
-        know = Knowledge(contract, log.live, base_fixings, rate_cal)
+        changed = log.advance(cutoff(period["determination"]))
         openings.append(dict(balance))
         margins.append({tid: margin_rate if deferred[tid] > 0 else ZERO for tid in ids})
+        restate.settled = idx
+        restate.correct_fixings([(o, n) for o, n in changed
+                                 if (o or n)["kind"] == "FIXING_CORRECTION" or (n and n["kind"] == "FIXING_CORRECTION")])
+        known = {}
+        for r in log.live.values():
+            if r["kind"] == "RATE_CHANGE":
+                known.setdefault(r["tranche_id"], []).append(r)
         rows = {}
         for t in tranches:
             tid = t["tranche_id"]
-            restated, (interest, after) = restate.refresh(
-                tid, idx, lambda j: accrue(prepayments, know, t, schedule[j], openings[j][tid], termination, margins[j][tid], regular))
+            restated, (interest, after) = restate.restate(tid, idx, known.get(tid, []))
             true_up = restated - recognised[tid]
             recognised[tid] = restated + interest
             current = interest + true_up + credit[tid]

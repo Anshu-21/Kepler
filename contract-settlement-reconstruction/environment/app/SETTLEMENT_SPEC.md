@@ -41,7 +41,7 @@ Fixed tranches use `annual_rate`. Floating tranches use `max(compounded, floor) 
 - A rate business day is a weekday not listed in `rate_holidays`. This is a different calendar from the payment calendar.
 - Every calendar day `t` in `[a, b)` belongs to the latest rate business day on or before `t` (which may fall before `a`). Days belonging to the same rate business day `i` form one run of `n_i` days.
 - The fixing for that run is the one for the rate business day `lookback_days` rate business days before `i`. `fixings` maps ISO dates to percentages: `"4.53"` means 0.0453.
-- A floating tranche may have `lockout_days` `L`, in which case some runs near the end of a period take a frozen fixing instead of their own. Which runs, and which fixing they take, is desk practice (see below). Without the field there is no lockout.
+- A floating tranche may have `lockout_days` `L`. Its lockout days in a period are the last `L` rate business days before that period's accrual end. A run whose rate business day is a lockout day takes the fixing of the rate business day just before the first lockout day instead, with the lookback applied from there. This is fixed by the period, so a segment that ends before the period does is still locked out on any lockout days it contains. Without the field there is no lockout.
 - `compounded = (product over runs of (1 + fixing * n_i / 360) - 1) * 360 / D`, with `D` the calendar days from `a` to `b`, rounded half up to seven decimal places. This 360 is the SOFR convention and does not depend on the tranche's day count.
 
 Year fractions, with `a = Y1-M1-D1` and `b = Y2-M2-D2`:
@@ -54,7 +54,7 @@ Year fractions, with `a = Y1-M1-D1` and `b = Y2-M2-D2`:
 - `30E/360 ISDA`: `D1 = 30` if `a` is the last day of its month; `D2 = 30` if `b` is the last day of its month, unless `b` is the termination date and in February. Otherwise days above 30 become 30. The termination date is the accrual end of the final period.
 - The 30-day conventions then use `(360 * (Y2 - Y1) + 30 * (M2 - M1) + D2 - D1) / 360`.
 
-Compute every product and fraction exactly before rounding. Withholding and reserve targets are products of exact decimals, and an exact half there rounds up. No other rounding in any contract, including the verifier's, lands within 1e-6 of a unit from a half, so `Decimal` in its default context reaches the same cents as exact arithmetic.
+Compute every product and fraction exactly before rounding. Withholding and reserve targets are products of exact decimals, and an exact half there rounds up. No other rounding in any contract, including the verifier's, lands within 1e-7 of a unit from a half, so `Decimal` in its default context reaches the same cents as exact arithmetic.
 
 ## Restatement and true-up
 
@@ -66,7 +66,7 @@ For each tranche on payment date `k`:
 
 - `interest` is the period's accrued interest with current knowledge.
 - Current interest is `interest + true_up` plus any credit carried from the previous period. When that is negative, current interest is zero and the negative amount is carried as credit to the next period instead. Credit only offsets current interest.
-- `overdue_interest` is the previous period's `deferred_interest` accrued at `overdue_rate` from the previous payment date to this one, rounded half up to the cent; the day basis is desk practice. It is zero in period 1.
+- `overdue_interest` is the previous period's `deferred_interest` times `overdue_rate` times the tranche's own year fraction from the previous payment date to this one, rounded half up to the cent. It is zero in period 1.
 - `interest_due` is current interest plus the previous `deferred_interest` plus `overdue_interest`.
 - `principal_due` is `scheduled_principal` plus the previous period's unpaid principal, capped at the balance after this period's prepayments. In the final period it is that whole balance.
 
@@ -74,7 +74,7 @@ The senior fee due is `senior_fee` plus any fee left unpaid in the previous peri
 
 ## Withholding
 
-A tranche with a `withholding_rate` has tax withheld from every interest payment made to it. The tax on a gross payment `P` is `P * withholding_rate` rounded half up to the cent, and the tranche is credited with `P` less that tax. The borrower grosses up, so a tranche's gross interest due is a whole-cent amount at least as large as its `interest_due`; how it is set is desk practice. A tranche without the field has a rate of zero, so its gross interest due is its `interest_due`.
+A tranche with a `withholding_rate` has tax withheld from every interest payment made to it. The tax on a gross payment `P` is `P * withholding_rate` rounded half up to the cent, and the tranche is credited with `P` less that tax. The borrower grosses up: the gross interest due is the smallest whole-cent amount whose credit after withholding is at least `interest_due`. A tranche without the field has a rate of zero, so its gross interest due is its `interest_due`.
 
 In the interest step each tranche's amount is its gross interest due, and pari passu sharing uses those gross amounts. `withholding` is the tax on what the tranche was paid and `interest_paid` is the credit after it, so the cash a tranche takes for interest is their sum. `deferred_interest` is `interest_due` minus `interest_paid`.
 
@@ -97,22 +97,11 @@ In the interest step each tranche's amount is its gross interest due, and pari p
 3. The reserve top-up, when there is a reserve.
 4. If `excess_cash` is `SWEEP`: for each level in ascending order, pay down the balances left after this period's principal. Whatever remains, or everything left when it is `RELEASE`, is `released`.
 
-Tranches with the same `seniority` are one level and share it pari passu: when the cash left cannot pay the level in full, each tranche gets `cash * its amount / level total` truncated to the cent, and the whole cents still left go one each to tranches of that level as desk practice shows. In a sweep, the amounts are the balances.
+Tranches with the same `seniority` are one level and share it pari passu: when the cash left cannot pay the level in full, each tranche gets `cash * its amount / level total` truncated to the cent, and the whole cents still left go one each in descending order of the tranche's amount, ties broken by ascending `tranche_id`. In a sweep, the amounts are the balances.
 
 `coverage_tests` maps some levels (as strings) to a trigger. The test of level `L` compares `collateral[k-1]` with the outstanding balance of every tranche in levels up to and including `L`, where outstanding means the balance after this period's prepayments less principal already paid in this waterfall. It passes when `outstanding * trigger <= collateral`. Otherwise the cure is `outstanding - collateral / trigger` rounded up to the cent, and it is paid from what cash is left to those levels in ascending order, pari passu by outstanding balance within a level, never more than a level's outstanding total. A cure is principal: it counts in both `cure_paid` and `principal_paid`, and the principal step later pays only what is still due, which is `principal_due` less principal already paid, floored at zero.
 
 Afterwards `deferred_interest` is interest due minus interest paid, `principal_due` less `principal_paid` (floored at zero) carries to the next period's principal due, and the balance falls by principal paid and swept. That balance opens the next accrual period.
-
-## Desk practice
-
-Four conventions are not written down anywhere; the desk follows what its production system has always done:
-
-- which runs a lockout freezes and which fixing they take;
-- the day basis of overdue interest;
-- how the withholding gross-up sets gross interest due;
-- which tranches get the whole cents left over in pari passu sharing.
-
-`/app/data/history/` holds settled statements from that system for contracts it has run. They are correct to the cent and follow every rule in this document, so they show what each convention is. Each one is the same on every contract, including the verifier's.
 
 ## Output
 
@@ -122,7 +111,7 @@ Money values are strings with exactly two decimals and a leading `-` only when n
 
 ## Bounds
 
-Every contract, including the verifier's, has two to ten tranches, `term_months` between 6 and 360, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 640 bookings and 80 prepayments, and fixings for every date a replay looks up.
+Every contract, including the verifier's, has two to twenty tranches, `term_months` between 6 and 600, `anchor_day` between 1 and 31, an `opening_date` that is a payment business day, `notice_days` between 1 and 5, `lookback_days` between 2 and 5, `lockout_days` (when present) between 1 and 3, withholding rates below 0.5, at most 12,000 bookings (one logical booking can be revised at every determination date of the term) and 120 prepayments, and fixings for every date a replay looks up.
 
 ## Runtime
 

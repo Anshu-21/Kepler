@@ -4,33 +4,35 @@ from model import make, settle
 
 ALL = ("ACT/360", "ACT/365F", "ACT/ACT ISDA", "ACT/ACT ICMA", "30/360", "30E/360", "30E/360 ISDA")
 LOW = (0.9, 1.0, 1.1, 1.25, 1.5)
+DC20 = ("ACT/360", "30E/360 ISDA", "ACT/ACT ISDA", "30/360", "ACT/365F", "ACT/ACT ICMA", "30E/360")
+KINDS = ("FIXED", "FLOATING", "FLOATING", "FIXED", "FLOATING")
 
 SPECS = [
-    # large contracts at the bounds: the runtime budget matters here
-    dict(seed=7101, opening="2030-01-31", term=360, anchor=31, accrual_dates="ADJUSTED",
-         day_counts=["ACT/ACT ICMA", "30E/360 ISDA", "ACT/ACT ISDA", "30/360", "ACT/365F", "30E/360", "ACT/360",
-                     "ACT/ACT ICMA", "ACT/365F", "30/360"],
-         kinds=["FIXED", "FLOATING", "FIXED", "FLOATING", "FLOATING", "FIXED", "FLOATING", "FLOATING", "FLOATING", "FIXED"],
-         seniority=[1, 2, 2, 3, 3, 4, 5, 5, 6, 6], notice_days=3, n_prepay=75, n_changes=230, n_fix=150,
-         coverage={"2": "3.50", "3": "2.20"}, collateral_mix=LOW,
-         withholding={"B": "0.30", "D": "0.15", "G": "0.20", "J": "0.15"}, reserve={"opening_balance": "18000.00", "target_rate": "0.0300", "floor": "15000.00", "covers": [1, 2]},
-         lockout={"B": 2, "H": 3}),
-    dict(seed=7102, opening="2031-08-29", term=348, anchor=29, accrual_dates="UNADJUSTED",
-         day_counts=["ACT/ACT ISDA", "ACT/360", "ACT/360", "30E/360 ISDA", "ACT/365F", "30/360", "ACT/360",
-                     "ACT/ACT ICMA", "30E/360"],
-         kinds=["FLOATING", "FLOATING", "FLOATING", "FIXED", "FLOATING", "FIXED", "FLOATING", "FIXED", "FLOATING"],
-         seniority=[1, 1, 2, 3, 3, 4, 5, 5, 6], notice_days=5, n_prepay=70, n_changes=220, n_fix=160,
-         waterfall="LEVEL_BY_LEVEL", floor_bias=True, coverage={"1": "5.00", "3": "2.00"}, collateral_mix=LOW,
-         withholding={"A": "0.15", "C": "0.30", "E": "0.20"}, reserve={"opening_balance": "20000.00", "target_rate": "0.0175", "floor": "20000.00", "covers": [1, 2, 3]},
-         lockout={"A": 1, "E": 3}),
-    dict(seed=7103, opening="2029-03-15", term=300, anchor=15, accrual_dates="ADJUSTED",
-         day_counts=list(ALL) + ["ACT/360", "ACT/365F", "ACT/360"],
-         kinds=["FLOATING", "FIXED", "FLOATING", "FIXED", "FLOATING", "FIXED", "FLOATING", "FLOATING", "FIXED", "FLOATING"],
-         seniority=[1, 2, 2, 2, 3, 4, 4, 5, 6, 6], notice_days=2, n_prepay=65, n_changes=210, n_fix=150,
-         excess_cash="RELEASE", coverage={"2": "1.55", "4": "1.20"}, collateral_mix=LOW,
-         cash_mix=(0.02, 0.1, 0.3, 0.8, 1.0, 1.0, 1.2, 1.5),
-         withholding={"C": "0.20", "D": "0.15", "H": "0.30"}, reserve={"opening_balance": "0.00", "target_rate": "0.0250", "floor": "10000.00", "covers": [1, 2, 3]},
-         lockout={"A": 2, "G": 2, "J": 1}),
+    # large contracts at the bounds: the runtime budget matters here.  Standing rate bookings re-confirmed
+    # from a pricing grid at almost every determination date make every earlier period restate each time.
+    dict(seed=7101, opening="2030-01-31", term=600, anchor=31, accrual_dates="ADJUSTED",
+         day_counts=[DC20[i % 7] for i in range(20)], kinds=[KINDS[i % 5] for i in range(20)],
+         seniority=[1, 2, 2, 3, 3, 4, 5, 5, 6, 6, 7, 7, 7, 8, 9, 9, 10, 11, 11, 12], notice_days=3,
+         n_prepay=110, n_changes=60, n_fix=150, coverage={"2": "3.50", "5": "2.20"}, collateral_mix=LOW,
+         withholding={"B": "0.30", "D": "0.15", "G": "0.20", "J": "0.15", "N": "0.30"},
+         reserve={"opening_balance": "18000.00", "target_rate": "0.0300", "floor": "15000.00", "covers": [1, 2]},
+         lockout={"B": 2, "H": 3, "M": 1}, rebook={t: (5, 0.97) for t in "ABCDEFGHIJKLMNOPQR"}),
+    dict(seed=7102, opening="2031-08-29", term=576, anchor=29, accrual_dates="UNADJUSTED",
+         day_counts=[DC20[(i + 3) % 7] for i in range(19)], kinds=[KINDS[(i + 2) % 5] for i in range(19)],
+         seniority=[1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 10, 11, 12, 12], notice_days=5,
+         n_prepay=100, n_changes=120, n_fix=200, waterfall="LEVEL_BY_LEVEL", floor_bias=True,
+         coverage={"1": "5.00", "3": "2.00"}, collateral_mix=LOW, withholding={"A": "0.15", "C": "0.30", "E": "0.20"},
+         reserve={"opening_balance": "20000.00", "target_rate": "0.0175", "floor": "20000.00", "covers": [1, 2, 3]},
+         lockout={"A": 1, "E": 3, "K": 2}, rebook={t: (4, 0.95) for t in "ABCDEFGHIJKLMNOPQ"}),
+    dict(seed=7103, opening="2029-03-15", term=540, anchor=15, accrual_dates="ADJUSTED",
+         day_counts=list(ALL) * 2 + ["ACT/360", "ACT/365F", "ACT/360", "ACT/360"],
+         kinds=[KINDS[(i + 4) % 5] for i in range(18)],
+         seniority=[1, 2, 2, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 12], notice_days=2,
+         n_prepay=120, n_changes=200, n_fix=200, excess_cash="RELEASE", coverage={"2": "1.55", "4": "1.20"},
+         collateral_mix=LOW, cash_mix=(0.02, 0.1, 0.3, 0.8, 1.0, 1.0, 1.2, 1.5),
+         withholding={"C": "0.20", "D": "0.15", "H": "0.30"},
+         reserve={"opening_balance": "0.00", "target_rate": "0.0250", "floor": "10000.00", "covers": [1, 2, 3]},
+         lockout={"A": 2, "C": 2, "H": 1}, rebook={t: (6, 0.9) for t in "ABCDEFGHIJKLMNO"}),
     # small contracts aimed at specific rules
     dict(seed=6104, opening="2029-02-28", term=12, anchor=31, accrual_dates="UNADJUSTED",
          day_counts=["30E/360 ISDA", "30/360", "30E/360 ISDA"], kinds=["FIXED", "FLOATING", "FLOATING"],
@@ -69,7 +71,7 @@ EXTRA = {
 }
 
 # sha256 of the canonical JSON of every (contract, expected) pair; guards against generator drift
-DIGEST = "77aa919836db5772cdcd4709b6fbaa26248a6f2004fd7310d0007b83056df6fa"
+DIGEST = "e3aba49338d5c486b9afa7860d9669bcd89f17f49a0a7e90be7f746de7e08858"
 
 
 def build(spec):

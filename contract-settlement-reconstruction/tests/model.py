@@ -189,6 +189,9 @@ class Knowledge:
         self.changes = sorted((e for e in live if e["kind"] == "RATE_CHANGE"),
                               key=lambda e: (e["effective_date"], e["logical_id"]))
         self.corrections = sorted((e["fixing_date"], e["fixing"]) for e in live if e["kind"] == "FIXING_CORRECTION")
+        self.by_tranche = {}
+        for e in self.changes:
+            self.by_tranche.setdefault(e["tranche_id"], []).append(e)
 
 
 def accrue_period(c, know, row, tranche, opening_balance, termination, audit, margin=F(0)):
@@ -265,8 +268,9 @@ class AccrualMemo:
 
     def __call__(self, know, j, tranche, opening, margin):
         row = self.rows[j]; tid = tranche["tranche_id"]
+        end = row["end"].isoformat()
         changes = tuple((e["effective_date"], e["logical_id"], e.get("annual_rate"), e.get("spread"))
-                        for e in know.changes if e["tranche_id"] == tid and parse(e["effective_date"]) < row["end"])
+                        for e in know.by_tranche.get(tid, ()) if e["effective_date"] < end)
         fixes = ()
         if tranche["rate"]["type"] == "FLOATING":
             lo = (row["start"] - timedelta(days=40)).isoformat(); hi = row["end"].isoformat()
@@ -484,7 +488,8 @@ def _spread(rng):
 def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniority, notice_days=2,
          n_prepay=4, n_changes=6, n_fix=4, waterfall="INTEREST_FIRST", excess_cash="SWEEP",
          cash_mix=(0.08, 0.3, 0.8, 1.0, 1.0, 1.15, 1.4), floor_bias=False, coverage=None,
-         collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None, lockout=None):
+         collateral_mix=(1.05, 1.15, 1.25, 1.35, 1.5, 1.7), withholding=None, reserve=None, lockout=None,
+         rebook=None):
     """Build one contract.  day_counts/kinds/seniority give one entry per tranche."""
     rng = random.Random(seed)
     start = parse(opening)
@@ -523,7 +528,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
             floor = (lowest + rng.randrange(20, 60)) if floor_bias else rng.choice((0, 0, 100, 250))
             t["rate"] = {"type": "FLOATING", "index": "SOFR", "spread": _spread(rng),
                          "floor": f"0.{floor:04d}", "lookback_days": rng.randrange(2, 6)}
-        if lockout and tid in lockout:
+        if lockout and tid in lockout and kind == "FLOATING":
             t["rate"]["lockout_days"] = lockout[tid]
         if withholding and tid in withholding:
             t["withholding_rate"] = withholding[tid]
@@ -599,6 +604,12 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
 
     for n in range(n_changes):
         k = rng.randrange(1, term); tid = rng.choice(ids)
+        if rebook and tid in rebook:
+            # a standing booking carries the tranche's rate; other changes go to tranches without one
+            others = [x for x in ids if x not in rebook]
+            if not others:
+                continue
+            tid = rng.choice(others)
         body = {"kind": "RATE_CHANGE", "tranche_id": tid, "effective_date": inside(k).isoformat()}
         if tid in floating:
             body["spread"] = _spread(rng)
@@ -615,6 +626,28 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
                 b["annual_rate"] = _rate(rng, 1000000, 9500000)
             return b
         revise(lid, body, rec, k, alter)
+    # standing rate bookings re-confirmed from a pricing grid at almost every determination date:
+    # one logical booking per tranche, effective early, revised hundreds of times
+    for tid, (grid, every) in (rebook or {}).items():
+        lid = f"RB-{tid}"
+        values = [_spread(rng) if tid in floating else _rate(rng, 3000000, 9500000) for _ in range(grid)]
+        key = "spread" if tid in floating else "annual_rate"
+        eff = inside(rng.randrange(1, 4)).isoformat()
+        rev, last = 0, None
+        for k in range(2, term + 1):
+            if rng.random() > every:
+                continue
+            rev += 1
+            det = rows[k - 1]["determination"]
+            moment = near_cutoff(det) if rng.random() < 0.3 else at(det - timedelta(days=rng.randrange(0, 20)))
+            if rev > 1 and rng.random() < 0.04:
+                bookings.append({"logical_id": lid, "revision": rev, "action": "RETRACT", "recorded_at": stamp(moment)})
+                last = None
+                continue
+            value = rng.choice([v for v in values if v != last])
+            last = value
+            bookings.append({"logical_id": lid, "revision": rev, "action": "SET", "recorded_at": stamp(moment),
+                             "kind": "RATE_CHANGE", "tranche_id": tid, "effective_date": eff, key: value})
     used = set()
     for n in range(n_fix):
         k = rng.randrange(1, term)
@@ -636,7 +669,7 @@ def make(seed, opening, term, anchor, accrual_dates, day_counts, kinds, seniorit
             b["fixing"] = f"{v // 100}.{v % 100:02d}"
             return b
         revise(lid, body, rec, k, alter)
-    for e, eid in zip(bookings, rng.sample(range(1000, 9000), len(bookings))):
+    for e, eid in zip(bookings, rng.sample(range(10000, 99999), len(bookings))):
         e["booking_id"] = eid
     rng.shuffle(bookings); rng.shuffle(c["prepayments"])
     c["bookings"] = bookings

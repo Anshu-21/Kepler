@@ -323,14 +323,14 @@
    "tranche_id": "A",
    "effective_date": "2028-05-05",
    "spread": "0.0385",
-   "booking_id": 6487
+   "booking_id": 97805
   },
   {
    "logical_id": "RC-002",
    "revision": 2,
    "action": "RETRACT",
    "recorded_at": "2029-01-25T18:52:24-04:00",
-   "booking_id": 3966
+   "booking_id": 57457
   },
   {
    "logical_id": "RC-002",
@@ -341,7 +341,7 @@
    "tranche_id": "C",
    "effective_date": "2028-10-23",
    "annual_rate": "0.08572426",
-   "booking_id": 6076
+   "booking_id": 91225
   },
   {
    "logical_id": "RC-003",
@@ -352,7 +352,7 @@
    "tranche_id": "A",
    "effective_date": "2028-05-05",
    "spread": "0.0353",
-   "booking_id": 5768
+   "booking_id": 86295
   },
   {
    "logical_id": "RC-001",
@@ -363,7 +363,7 @@
    "tranche_id": "B",
    "effective_date": "2028-11-20",
    "annual_rate": "0.04664952",
-   "booking_id": 3874
+   "booking_id": 55985
   }
  ],
  "collections": [
