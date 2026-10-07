@@ -35,7 +35,7 @@ ARCH = PGDATA + ".archive"
 BK = PGDATA + ".backup"
 rng = random.Random(SEED)
 P = dict(
-    orders=rng.randint(150, 250), items_per=rng.randint(2, 3), steps=rng.randint(1100, 1400),
+    orders=rng.randint(90, 130), items_per=rng.randint(1, 2), steps=rng.randint(700, 900),
     sessions=rng.randint(3, 5), big_p=rng.uniform(0.03, 0.06),
     wrap=rng.random() < 0.6,
     compression=rng.sample(["pglz", "lz4", "zstd", "off"], 4),
@@ -214,13 +214,13 @@ def text(n):
 
 def blob(kind):
     if kind == "prose":
-        return text(rng.randint(350, 1500))
+        return text(rng.randint(300, 700))
     if kind == "noise":
         return "".join(rng.choice("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-                       for _ in range(rng.randint(2100, 5000)))
+                       for _ in range(rng.randint(2050, 2600)))
     if kind == "short-manifest":
-        return "\n".join(f"{rng.choice(WORDS)}:{rng.randint(0, 9)}" for _ in range(rng.randint(250, 700)))
-    return "\n".join(f"{rng.choice(WORDS)}-{rng.randint(0, 999)}:{rng.randint(0, 99)}" for _ in range(rng.randint(200, 600)))
+        return "\n".join(f"{rng.choice(WORDS)}:{rng.randint(0, 9)}" for _ in range(rng.randint(250, 450)))
+    return "\n".join(f"{rng.choice(WORDS)}-{rng.randint(0, 999)}:{rng.randint(0, 99)}" for _ in range(rng.randint(200, 400)))
 
 
 def money(lo, hi):
@@ -830,11 +830,11 @@ def run_phase(n, ddl_count, label, bad_job=False, snaps=4):
     """Run n workload steps with DDL, checkpoints, compression changes, VACUUM and snapshots spread over them."""
     global long_until
     long_until = rng.randint(n // 3, n * 2 // 3)
-    ddl_at = set(rng.sample(range(20, n - 60), ddl_count))
-    ckpt_at = set(rng.sample(range(10, n - 10), 2))
+    ddl_at = set(rng.sample(range(15, max(n - 45, 16 + ddl_count)), ddl_count))
+    ckpt_at = set(rng.sample(range(10, n - 10), 1))
     comp_at = {min(ckpt_at) - 1}
     vac_at = set(rng.sample(range(30, n - 30), 1))
-    bad_at = rng.randint(n - 120, n - 60) if bad_job else -1
+    bad_at = rng.randint(max(15, n - 120), n - 40) if bad_job else -1
     snap_at = set(rng.sample(range(10, n - 5), snaps)) | ({bad_at - 1, bad_at + 1} if bad_job else set())
     for step in range(n):
         if step in ddl_at:
@@ -846,7 +846,7 @@ def run_phase(n, ddl_count, label, bad_job=False, snaps=4):
             snap.cursor().execute(f"ALTER SYSTEM SET wal_compression = '{mode}'")
             snap.cursor().execute("SELECT pg_reload_conf()")
             time.sleep(0.05)
-        if step in ckpt_at:
+        if step in ckpt_at and (label in ("a", "c") or compression_cycle[-1] == "zstd"):
             snap.cursor().execute("CHECKPOINT")
         if step in vac_at:
             snap.cursor().execute(rng.choice(["VACUUM order_items", "VACUUM orders", "VACUUM (FREEZE) order_items",

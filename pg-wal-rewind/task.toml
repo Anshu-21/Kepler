@@ -78,7 +78,7 @@ Throughout, the script captured the live result of SELECT * of the three tables,
 
 The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR`, in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
 
-Measured with 2 CPUs: the reference scores 1 and answers a dataset's 72 to 81 queries in about 15 seconds, using about 110 MB. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
+Measured with 2 CPUs: the reference scores 1 and answers a dataset's 72 to 81 queries in 8 to 16 seconds, using about 110 MB. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
 - not decoding Zstandard page images;
 - printing float8 with Python's shortest repr;
 - following only the relations present in the backup;
