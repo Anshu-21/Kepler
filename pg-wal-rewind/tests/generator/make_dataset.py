@@ -425,6 +425,8 @@ k.execute("VACUUM FULL pg_attribute")
 k.execute("VACUUM FULL pg_type")
 k.execute("VACUUM FULL pg_enum")
 k.execute("VACUUM (FREEZE) order_items")
+k.execute("SELECT pg_relation_filenode('orders')")
+ORDERS_NODE0 = k.fetchone()[0]
 ddl.autocommit = False
 
 truth = []
@@ -669,6 +671,7 @@ def has_column(table, col):
 # Each change: (query that is true once the change is in place, statements). do_ddl applies the first
 # change not yet in place, so after a restore the lost changes are made again, in the same order.
 DDL_OPS = [
+    (f"SELECT pg_relation_filenode('orders') <> {ORDERS_NODE0}", ["VACUUM FULL orders"]),
     (has_column("orders", "channel"), ["ALTER TABLE orders ADD COLUMN channel text NOT NULL DEFAULT 'web'",
                                        "ALTER TABLE order_items ADD COLUMN warehouse smallint"]),
     (has_column("orders", "stage"), ["ALTER TABLE orders ADD COLUMN stage order_stage NOT NULL DEFAULT 'queued'"]),

@@ -16,6 +16,7 @@ Three tables matter: `public.orders`, `public.order_items` and `public.shipments
 * Columns were added and dropped, some with defaults. One column has an enum type whose values were later renamed and extended. Another has a domain type, and there are `interval` and `float8` columns.
 * Rows were upserted, copied in with `COPY`, locked, updated, moved between partitions, and deleted.
 * Partitions were created, attached and detached. Tables that had been built separately were attached as partitions; one of them has its own column order.
+* `orders` was rewritten once with `VACUUM FULL`, early on timeline 1.
 * Some transactions used savepoints or two-phase commit.
 * Bad jobs rewrote and deleted rows, and `VACUUM` then removed the old row versions from the heap.
 * Bad jobs were twice undone with a point-in-time restore from the older backup.
@@ -35,7 +36,7 @@ Auditors now ask what `SELECT *` returned on the primary at many past instants. 
 | `backup/pg_xact/`, `backup/pg_multixact/` | those directories as they were in that backup |
 | `wal/` | the archive, from the segment of the idle checkpoint onward: the segments of every timeline and the timeline history files |
 
-A relation that only ever existed on an abandoned timeline exists only in the WAL.
+Files that were dropped before the final backup, such as the ones a rewrite replaced, are gone. A relation that only ever existed on an abandoned timeline exists only in the WAL.
 
 ## What the tool returns
 

@@ -20,7 +20,7 @@ BLCKSZ = 8192
 EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 # rmgr ids
-RM_XLOG, RM_XACT, RM_MULTIXACT, RM_HEAP2, RM_HEAP = 0, 1, 6, 9, 10
+RM_XLOG, RM_XACT, RM_SMGR, RM_MULTIXACT, RM_HEAP2, RM_HEAP = 0, 1, 2, 6, 9, 10
 
 # infomask bits
 HEAP_HASNULL = 0x0001
@@ -394,6 +394,30 @@ def undo(rmid, info, bid, blocks, main, pg):
     return pg
 
 
+def dropped_rels(info, main):
+    """Relfilenumbers a commit record says it drops."""
+    p, xinfo = 8, 0
+    if info & 0x80:
+        xinfo = u32(main, p)
+        p += 4
+    if xinfo & 0x01:
+        p += 8
+    if xinfo & 0x02:
+        p += 4 + 4 * u32(main, p)
+    if not xinfo & 0x04:
+        return []
+    return [u32(main, p + 4 + 12 * i + 8) for i in range(u32(main, p))]
+
+
+def ghost_key(t, toast):
+    hoff = t[22]
+    if toast:  # chunk_id, chunk_seq: VACUUM FULL keeps the value ids of TOAST values
+        return bytes(t[hoff:hoff + 8])
+    # The rewrite keeps xmin, but it may clear a dead xmax, reuse the command-id field and toast a long value
+    # differently; the leading key column (orders.order_id) and xmin name a row version.
+    return bytes(t[0:4]) + bytes(t[hoff:hoff + 8])
+
+
 class Base:
     """What every timeline shares: the pages as they were at the checkpoint the archive starts with, rebuilt
     from the base backup taken at the end, plus the backup's pg_xact and pg_multixact for the transactions
@@ -451,8 +475,14 @@ class Base:
 
         # first change to each page on the final timeline's path
         seen = set()
+        created = set()
         for _, end, rec in Wal(wal_dir, paths[final_tli]).records(self.start):
             rmid, info = rec[17], rec[16]
+            if rmid == RM_SMGR and (info & 0xF0) == 0x10:
+                rel = decode_record(rec)[4]
+                if u32(rel, 4) == self.db:
+                    created.add(u32(rel, 8))
+                continue
             if rmid not in (RM_HEAP, RM_HEAP2) and not (rmid == RM_XLOG and (info & 0xF0) == 0xB0):
                 continue
             if rmid == RM_HEAP2 and (info & 0x70) == 0x40:  # VISIBLE leaves the heap page's tuples alone
@@ -472,8 +502,47 @@ class Base:
                     pg = Page.parse(b.image)
                     self.pages[key] = undo(rmid, info, bid, blocks, main, pg) if rmid != RM_XLOG else pg
                     self.rels.add(key[0])
+        for key in [k for k in self.pages if k[0] in created]:  # did not exist yet
+            del self.pages[key]
         for pg in self.pages.values():
             pg.lsn = 0
+        self.add_rewrite_ghosts(data_dir, paths[final_tli], created)
+
+    def add_rewrite_ghosts(self, data_dir, path, created):
+        """A VACUUM FULL in the archive drops the table's old files, which are not in the backup. Their pages
+        that no record touched before the rewrite are lost, but every tuple on them that anybody could still
+        see was copied, header and all (TOAST values keep their ids), into the new files the rewrite wrote
+        as page images. So, at the rewrite's commit, the new file's tuples that are not copies of the old
+        file's known tuples are the lost pages' tuples; they stand for those pages from the start."""
+        rp = Replayer(self, data_dir, path)
+        for _, end, rec in rp.stream:
+            xid, info, rmid, blocks, main = decode_record(rec)
+            gone = []
+            if rmid == RM_XACT and (info & 0x70) == 0x00:
+                gone = [r for r in dropped_rels(info, main) if r not in created]
+            if not gone:
+                rp.apply(end, xid, info, rmid, blocks, main)
+                continue
+            before = Snapshot(rp).classes
+            rp.apply(end, xid, info, rmid, blocks, main)
+            after = Snapshot(rp).classes
+            for oid, c in before.items():
+                old = c["filenode"]
+                if old in gone and c["kind"] in "rt" and oid in after and after[oid]["filenode"] != old:
+                    toast = c["kind"] == "t"
+                    known = {}
+                    for t in rp.tuples(old):
+                        k = ghost_key(t, toast)
+                        known[k] = known.get(k, 0) + 1
+                    lost = []
+                    for t in rp.tuples(after[oid]["filenode"]):
+                        k = ghost_key(t, toast)
+                        if known.get(k):
+                            known[k] -= 1
+                        else:
+                            lost.append(bytearray(t))
+                    self.pages[(old, 1 << 30)] = Page(0, {i + 1: ("n", t) for i, t in enumerate(lost)})
+                    self.rels.add(old)
 
 
 class Replayer:
