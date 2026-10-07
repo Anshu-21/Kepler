@@ -8,41 +8,24 @@ author_name = "Anshu Kumar"
 author_email = "kumaranshu303393@gmail.com"
 difficulty_explanation = """Every dataset was produced by a real PostgreSQL 16.15 server running a synthetic, seeded order workload written for this task; no production data is involved.
 
-This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive. They must answer "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after two point-in-time restores forked the cluster onto new timelines. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow. Here none is installed, and the agent has to build that reader from the PostgreSQL sources shipped in the environment.
+This is the job of a database reliability engineer or PostgreSQL consultant doing an audit or a recovery from a base backup and a WAL archive. They must answer "what did this table contain at time T" for many instants, after VACUUM has removed the old row versions and after two point-in-time restores forked the cluster. Tools that read WAL directly (pg_waldump, logical-decoding forensics, change-data-capture readers) exist because restoring a server per question is too slow. Here none is installed, and the agent builds that reader from the PostgreSQL sources shipped in the environment.
 
-One correct answer needs all of the following:
-- the WAL page and record format:
-  - long and short page headers, and records that cross page and 1 MB segment boundaries;
-  - block references with forks, and records with no main data, such as the XLOG_FPI images a table rewrite writes;
-  - page images with holes, compressed with pglz, LZ4 or Zstandard depending on when they were written, which means writing a Zstandard decoder (Huffman literals, FSE tables, repeat offsets) from a format description;
-  - the redo rules for the heap: insert, multi-insert from COPY, update and HOT update with prefix and suffix taken from the old tuple, delete, lock, speculative-insert confirmation, prune, vacuum, freeze, in-place catalog updates;
-- relations that do not exist in the backup: a VACUUM FULL and an ALTER COLUMN TYPE move two tables to new files, and new partitions are created after the backup, so their pages exist only as page images and initialised pages in the WAL;
-- the transaction rules: commit and abort records with subtransactions, COMMIT PREPARED records whose committed xid is the prepared transaction's rather than the record's, multixacts whose members come from WAL records or from the backed-up pg_multixact, lock-only xmax, frozen tuples, and transaction ids that wrap past 2^32 in three of the five sealed datasets;
-- point-in-time recovery semantics as of an instant, since replaying to the end and filtering afterwards loses the versions VACUUM removed;
-- three timelines:
-  - the history files, and segments of several timelines for the same positions;
-  - timeline 3 branches from timeline 1, after the point where timeline 2 branched, so it needs timeline 1 WAL that timeline 2 does not;
-  - which timeline was live at the instant;
-- the catalog as of the instant:
-  - pg_class, pg_attribute and pg_type are found through pg_filenode.map (all were rewritten), and table and TOAST filenodes differ from their OIDs and change during the window;
-  - columns are added and dropped, with fast defaults stored as arrays in attmissingval, including an enum default;
-  - the namespace must be checked because another schema has tables of the same names;
-  - the partitioned table is the union of its leaf partitions according to pg_inherits at that instant, two levels deep. One partition has its own physical column order and a dropped column, so columns map by name. Partitions are attached, detached and created in the window, and a column added to the parent lives in each partition's attmissingval;
-  - enum values come from pg_enum as of the instant (a value is renamed and another added), and a domain resolves to its base type through pg_type;
-- the values themselves:
-  - alignment, null bitmaps, short and external varlenas, and TOAST with pglz and LZ4;
-  - numeric with its display scale, timestamps and dates;
-  - interval in the postgres style with its sign rules;
-  - jsonb containers (offsets and lengths of JEntries, aligned numerics, raw scalars) printed with PostgreSQL's spacing and escapes;
-  - arrays with null bitmaps, several dimensions, non-default lower bounds and quoting;
-  - float8 printed as PostgreSQL's Ryu build prints it. That build excludes the rounding boundaries, so for some values its output differs from Python's shortest repr.
+The code itself is moderate: a WAL record reader, heap redo on a page model, commit tracking, MVCC visibility, a catalog reader and value output for a dozen common types. The reference is about 1,100 lines of Python. The difficulty is that the history contains several situations where the obvious implementation is wrong and nothing on the box says so:
+- Timeline 3 branches from timeline 1, after the point where timeline 2 branched. A reader that chains timelines in numeric order, or that assumes the newest history file extends the previous one, replays the wrong WAL.
+- A VACUUM FULL and an ALTER COLUMN TYPE move two tables to new files, and new partitions are created after the backup. Those relations are not in the backup at all and must be picked up from initialised pages and page images in the WAL. Some of those images arrive as XLOG_FPI records with no main data, which a header parser that waits for a main-data marker misreads.
+- The catalog must be read as of the instant, because the answer depends on it:
+  - pg_class, pg_attribute and pg_type are mapped relations, and filenodes change in the window;
+  - the enum's labels are renamed and extended;
+  - a domain resolves to its base type;
+  - partitions are attached and detached. One attached table has its own physical column order and a dropped column, so columns must map by name, and another lives in a different schema;
+  - a column is dropped and re-added on the partitioned table, and fast defaults live in each partition's attmissingval.
+- Visibility needs the details right: subtransactions, COMMIT PREPARED (whose committed xid is the prepared transaction's), multixacts from WAL records or from the backed-up pg_multixact, lock-only xmax, frozen tuples, and xids that wrap past 2^32 in four of the five sealed datasets.
+- Point-in-time semantics: replaying to the end and filtering by commit time loses the versions VACUUM removed.
 
-Each of these is documented somewhere in the sources or the reference notes, but nothing assembles them, and one mistake changes the answer. The staging dataset has live answers for orders and shipments only, at two early instants: on timeline 1 before either restore, before the rewrites, the partition changes and the enum rename, and long before the bad jobs. Nothing checks order_items' arrays, intervals, domain or float8 values. Most of the history has to be gotten right by reasoning. A PostgreSQL internals expert would need several working days."""
-solution_explanation = """Read the archive. List the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs; a history file may skip a timeline. Decide which timeline answers an instant: a timeline is live from its first commit record after its branch point, and timeline 1 is live before any of those. Then replay that timeline's path from the backup.
+The staging dataset has live answers for orders and shipments only, at two early instants: before either restore, before the rewrites, the partition changes and the enum rename. So most of the history has to be gotten right by reasoning from the sources rather than by comparing with known answers. A PostgreSQL internals expert who knows these pitfalls would need most of a working day; finding them without being told is the hard part."""
+solution_explanation = """Read the archive. List the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs; a history file lists only the timeline's real ancestors. Decide which timeline answers an instant: a timeline is live from its first commit record after its branch point, and timeline 1 before any of those. Then replay that timeline's path from the backup.
 
-Load the backed-up pages. Read records from the backup label's start LSN: skip page headers, join records that span pages, and follow XLOG_SWITCH to the next segment.
-
-Decode the block references; the block headers end where the declared data lengths begin, which matters for records without main data. Restore page images after decompressing them and refilling the hole. Zstandard images need a frame decoder covering raw, RLE and compressed blocks, Huffman-coded literals with direct or FSE-coded weights, and FSE-coded sequences with repeat offsets.
+Load the backed-up pages. Read records from the backup label's start LSN: skip page headers, join records that span pages, and follow XLOG_SWITCH to the next segment. Decode the block references; the block headers end where the declared data lengths begin, which matters for records without main data. Restore page images after decompressing them (pglz or LZ4) and refilling the hole.
 
 Apply heap and heap2 redo, and XLOG_FPI images, on a per-page model of line pointers and tuple bytes, for any relation of the database. A relation missing from the backup starts with its first initialised page or page image. Skip blocks whose page LSN is already past the record.
 
@@ -52,25 +35,30 @@ Visibility at that point: a version counts if its xmin is frozen or committed, a
 
 Read pg_class (through pg_filenode.map for mapped catalogs), pg_namespace, pg_type, pg_enum, pg_inherits and pg_attribute with the same rule, as of the instant:
 - find the table in public;
-- expand a partitioned table to its leaf partitions through pg_inherits;
-- for each leaf, map the parent's columns to the leaf's attributes by name, and find its filenode and TOAST filenode.
+- expand a partitioned table to its leaf partitions through pg_inherits, whatever their schema;
+- for each leaf, map the parent's columns to the leaf's live attributes by name, and find its filenode and TOAST filenode.
 
 Then decode each tuple:
 - walk dropped columns too, and honour the null bitmap and the varlena alignment rule;
 - use attmissingval for attributes past the tuple's natts, and detoast through the TOAST relation;
-- render values in the server's text format: domains through their base type and enums through pg_enum;
-- arrays per element with array_out's quoting and bounds, jsonb by walking its containers, interval with EncodeInterval's postgres style, and float8 with a port of d2s.c's d2d() (no STRICTLY_SHORTEST)."""
+- render values in the server's text format, with domains through their base type and enums through pg_enum."""
 verification_explanation = """Each of the five sealed datasets was produced by tests/generator/make_dataset.py with PostgreSQL 16.15. The script works as follows:
-- It builds a cluster with 1 MB segments and WAL archiving. In most seeds (three of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
-- It loads the schema: orders, order_items and a two-level partitioned shipments table, plus a separately built legacy table with its own column order. The types include an enum, a domain, jsonb, text and int arrays, interval and float8. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
+- It builds a cluster with 1 MB segments and WAL archiving. In most seeds (four of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
+- It loads the schema: orders, order_items and a two-level partitioned shipments table, a separately built legacy table with its own column order and a dropped column, a table in the archive schema built like shipments, an enum and a domain. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
 - It takes a pg_basebackup while sessions keep writing.
 - It then runs a seeded workload of three to five interleaved sessions:
   - inserts, upserts and COPY;
   - HOT and non-HOT updates (toasted and not), updates that move rows between partitions, and deletes;
   - FOR UPDATE and FOR KEY SHARE locks that become multixacts;
   - savepoints rolled back and released, and PREPARE TRANSACTION with later COMMIT or ROLLBACK PREPARED;
-  - checkpoints, VACUUM and VACUUM FREEZE, and wal_compression cycling through pglz, lz4, zstd and off.
-- Its schema changes are applied in a fixed order and redone after each restore: column additions and drops, a column of the enum type with a default, attaching the legacy table, VACUUM FULL orders, an enum value renamed, a partition created, ALTER COLUMN TYPE on order_items, a partition detached, an enum value added, and a column with a default added to the partitioned table.
+  - checkpoints, VACUUM and VACUUM FREEZE, and wal_compression cycling through pglz, lz4 and off.
+- Its schema changes are applied in a fixed order and redone after each restore:
+  - column additions and drops, including a column of the enum type with a default;
+  - attaching the legacy table, then the archive-schema table;
+  - VACUUM FULL orders, and ALTER COLUMN TYPE on order_items;
+  - an enum value renamed, and later one added;
+  - a partition created and another detached;
+  - a column dropped from the partitioned table and re-added with a default, and another column with a default added to it.
 - On timeline 1 it captures two restore points and runs a bad bulk job. It then restores the base backup to the first restore point, which makes timeline 2, and runs more of the same with another bad job. Then it restores again, to the second restore point on timeline 1, which makes timeline 3, and runs the last phase. The abandoned WAL stays in the archive.
 - It ends with shared locks, a bad job, the VACUUM that removes the old versions, one transaction left open and one prepared.
 
@@ -78,23 +66,20 @@ Throughout, the script captured the live result of SELECT * of the three tables,
 
 The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR`, in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
 
-Measured with 2 CPUs: the reference scores 1 and answers a dataset's 72 to 81 queries in 8 to 16 seconds, using about 110 MB. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
-- not decoding Zstandard page images;
-- printing float8 with Python's shortest repr;
+Measured with 2 CPUs: the reference scores 1 and answers a dataset's 78 to 81 queries in 8 to 11 seconds. The skeleton scores 0. Each of these single mistakes injected into the reference fails all five sealed datasets:
 - following only the relations present in the backup;
 - mapping a partition's columns by position;
+- keeping partitions that were detached;
+- only following partitions in the parent's schema;
 - reading enum labels from any version of pg_enum rather than the one visible at the instant;
 - treating timeline 3 as a child of timeline 2;
-- dropping non-default array lower bounds;
-- printing jsonb without PostgreSQL's spacing;
-- leaving out the "+" that follows a negative interval field;
 - not resolving the domain to its base type;
 - returning NULL for a partition's fast-default column;
 - replaying to the end and filtering by commit time."""
 category = "Software"
 subcategory = "Databases"
-tags = ["postgresql", "wal", "point-in-time-recovery", "mvcc", "storage-format", "zstd", "python"]
-expert_time_estimate_hours = 24
+tags = ["postgresql", "wal", "point-in-time-recovery", "mvcc", "storage-format", "python"]
+expert_time_estimate_hours = 10
 relevant_experience = "I work on backend services in Python and JavaScript that run on PostgreSQL, and I have dealt with the recovery side of it: restoring rows after bad migrations, point-in-time restores, and reading PostgreSQL internals (WAL records, heap pages, TOAST, transaction status) to understand what happened. I wrote the workload generator that produced these datasets from a real server and the reference tool, and I checked the tool against live query results captured during each run."
 
 [verifier]

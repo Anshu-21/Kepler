@@ -4,11 +4,10 @@ Usage (as root, PostgreSQL 16 installed, server runs as user `claude`):
     python3 make_dataset.py SEED OUT_DIR SOCKET_DIR PGDATA
 
 Builds a cluster with 1 MB WAL segments and WAL archiving, loads an order schema (two plain
-tables and a partitioned one, an enum, a domain, jsonb, arrays, intervals and floats), takes a
-base backup while the workload keeps running, then runs a seeded multi-session workload (DDL,
-partition attach/detach/create, table rewrites, enum renames, upserts, COPY, locks that become
-multixacts, savepoints, two-phase commits, checkpoints, VACUUM, a wal_compression that cycles
-through pglz, lz4, zstd and off), two point-in-time restores (timeline 2 from timeline 1, then
+tables and a partitioned one, an enum and a domain), takes a base backup while the workload keeps
+running, then runs a seeded multi-session workload (DDL, partition attach/detach/create, table
+rewrites, enum renames, upserts, COPY, locks that become multixacts, savepoints, two-phase
+commits, checkpoints, VACUUM, a changing wal_compression), two point-in-time restores (timeline 2 from timeline 1, then
 timeline 3 from timeline 1 again), bad bulk jobs and the VACUUM that erases the old row
 versions. While the workload runs it records the live SELECT * of the three tables at quiet
 instants.
@@ -35,10 +34,10 @@ ARCH = PGDATA + ".archive"
 BK = PGDATA + ".backup"
 rng = random.Random(SEED)
 P = dict(
-    orders=rng.randint(90, 130), items_per=rng.randint(1, 2), steps=rng.randint(700, 900),
+    orders=rng.randint(130, 200), items_per=rng.randint(1, 3), steps=rng.randint(850, 1100),
     sessions=rng.randint(3, 5), big_p=rng.uniform(0.03, 0.06),
     wrap=rng.random() < 0.6,
-    compression=rng.sample(["pglz", "lz4", "zstd", "off"], 4),
+    compression=rng.sample(["pglz", "lz4", "off"], 3),
 )
 CTL = os.path.join(PGBIN, "pg_ctl")
 TABLES = ("orders", "order_items", "shipments")
@@ -152,8 +151,7 @@ CREATE TABLE orders (
   gift boolean,
   legacy_code varchar(16),
   notes text,
-  manifest text,
-  attrs jsonb
+  manifest text
 ) WITH (fillfactor = 80);
 ALTER TABLE orders ALTER COLUMN manifest SET COMPRESSION lz4;
 CREATE TABLE order_items (
@@ -164,11 +162,7 @@ CREATE TABLE order_items (
   unit_price numeric(10,2) NOT NULL,
   discount numeric,
   note text,
-  tags text[],
-  dims int4[],
-  lead_time interval,
-  weight weight_kg,
-  ratio float8
+  weight weight_kg
 );
 CREATE TABLE shipments (
   ship_id bigint NOT NULL,
@@ -176,8 +170,7 @@ CREATE TABLE shipments (
   carrier text NOT NULL,
   shipped_on date NOT NULL,
   cost numeric(10,2),
-  label text,
-  payload jsonb
+  label text
 ) PARTITION BY RANGE (shipped_on);
 CREATE TABLE shipments_2025 PARTITION OF shipments FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 CREATE TABLE shipments_2026 PARTITION OF shipments FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')
@@ -192,10 +185,10 @@ CREATE TABLE shipments_legacy (
   cost numeric(10,2),
   ship_id bigint NOT NULL,
   shipped_on date NOT NULL,
-  order_id bigint,
-  payload jsonb
+  order_id bigint
 );
 ALTER TABLE shipments_legacy DROP COLUMN junk;
+CREATE TABLE archive.shipments_2019 (LIKE shipments);
 """)
 ddl.commit()
 
@@ -203,9 +196,6 @@ WORDS = ("alpha bravo crate delta eagle fjord gamma harbor iris jade kilo lumen 
          "raven sable tundra umber vivid willow xenon yarrow zephyr").split()
 STATUSES = ["new", "paid", "packed", "shipped", "delivered", "returned", "on_hold"]
 CARRIERS = ["ups", "dhl", "fedex", "post"]
-ODD_STRINGS = ["", " ", "NULL", "null", "a,b", "{x}", 'say "hi"', "back\\slash", "tab\there", "line\nbreak",
-               "  padded  ", "caf\u00e9", "\u043a\u043b\u044e\u0447", "\U0001F4E6 box", "semi;colon", "quote'single",
-               "\u0001ctl", "\\\"mixed\\\"", "[1:2]", "x" * 40]
 
 
 def text(n):
@@ -248,144 +238,7 @@ def discount():
     return f"{rng.uniform(0, 500):.{rng.randint(1, 6)}f}"
 
 
-# ---------------------------------------------------------------- value generators for the richer types
-
-def json_string(s):
-    out = ['"']
-    for ch in s:
-        if ch == '"':
-            out.append('\\"')
-        elif ch == "\\":
-            out.append("\\\\")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\t":
-            out.append("\\t")
-        elif ord(ch) < 0x20:
-            out.append("\\u%04x" % ord(ch))
-        elif rng.random() < 0.03 and ch.isalpha():
-            out.append("\\u%04X" % ord(ch) if ord(ch) < 0x10000 else ch)
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
-
-
-def json_number():
-    r = rng.random()
-    if r < 0.3:
-        return str(rng.randint(-1000, 100000))
-    if r < 0.45:
-        return f"{rng.uniform(-500, 500):.{rng.randint(1, 4)}f}"
-    if r < 0.55:
-        return rng.choice(["1.50", "-0.0001", "0.000", "1e3", "2E-2", "-0", "12345678901234567890", "3.14159265358979323846",
-                           "1.0e+2", "-7.25e-3", "0.1", "100"])
-    if r < 0.7:
-        return str(rng.randint(0, 9))
-    return f"{rng.randint(0, 9999)}.{rng.randint(0, 99):02d}"
-
-
-def json_value(depth=0, big=False):
-    r = rng.random()
-    if depth >= 3 or (r < 0.45 and not big):
-        k = rng.random()
-        if k < 0.35:
-            return json_number()
-        if k < 0.7:
-            return json_string(rng.choice(ODD_STRINGS) if rng.random() < 0.3 else text(rng.randint(1, 3)))
-        return rng.choice(["true", "false", "null"])
-    if r < 0.75 or big:
-        n = rng.randint(0, 5) if not big else rng.randint(60, 200)
-        keys = [rng.choice(WORDS + ODD_STRINGS[:12]) + ("" if rng.random() < 0.7 else str(rng.randint(0, 99)))
-                for _ in range(n)]
-        if keys and rng.random() < 0.2:
-            keys.append(keys[0])  # duplicate key: the last one wins
-        return "{" + ", ".join(f"{json_string(k)}: {json_value(depth + 1)}" for k in keys) + "}"
-    n = rng.randint(0, 6)
-    return "[" + ",".join(json_value(depth + 1) for _ in range(n)) + "]"
-
-
-def attrs_value(big=False):
-    r = rng.random()
-    if r < 0.15:
-        return None
-    if r < 0.22:
-        return rng.choice(['"just text"', "42", "null", "true", "[]", "{}", "-1.50", '"a\\"b"'])
-    return json_value(0, big)
-
-
-def array_literal(elems, quote=True):
-    def one(e):
-        if e is None:
-            return "NULL"
-        if not quote:
-            return str(e)
-        return '"' + str(e).replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return "{" + ",".join(one(e) for e in elems) + "}"
-
-
-def text_array():
-    r = rng.random()
-    if r < 0.15:
-        return None
-    if r < 0.22:
-        return "{}"
-    pick = lambda: None if rng.random() < 0.08 else (rng.choice(ODD_STRINGS) if rng.random() < 0.4 else rng.choice(WORDS))
-    if r < 0.3:
-        n = rng.randint(1, 3)
-        return "{" + ",".join(array_literal([pick() for _ in range(2)]) for _ in range(n)) + "}"
-    elems = [pick() for _ in range(rng.randint(1, 6))]
-    if r < 0.36:
-        lo = rng.randint(-2, 5)
-        return f"[{lo}:{lo + len(elems) - 1}]={array_literal(elems)}"
-    return array_literal(elems)
-
-
-def int_array():
-    r = rng.random()
-    if r < 0.2:
-        return None
-    if r < 0.27:
-        return "{}"
-    pick = lambda: None if rng.random() < 0.1 else rng.randint(-100000, 100000)
-    if r < 0.37:
-        return "{" + ",".join(array_literal([pick() for _ in range(3)], quote=False) for _ in range(2)) + "}"
-    vals = [pick() for _ in range(rng.randint(1, 5))]
-    if r < 0.45:
-        lo = rng.randint(0, 3)
-        return f"[{lo}:{lo + len(vals) - 1}]={array_literal(vals, quote=False)}"
-    return array_literal(vals, quote=False)
-
-
-def interval_value():
-    r = rng.random()
-    if r < 0.15:
-        return None
-    if r < 0.45:
-        return rng.choice(["1 day", "00:00:00", "-00:00:00.5", "36 hours", "1.5 days", "2 weeks", "P1Y2M3DT4H5M6S",
-                           "-1 year 2 mons -3 days +04:05:06.789", "1 mon -1 day", "-2 mons", "1 year", "3 years 1 mon",
-                           "-1 days -02:00:00", "5 days 23:59:59.999999", "100 years", "0.25 seconds", "-7 days 01:00"])
-    parts = []
-    for unit, lo, hi in (("years", -3, 3), ("mons", -14, 14), ("days", -40, 40)):
-        if rng.random() < 0.4:
-            parts.append(f"{rng.randint(lo, hi)} {unit}")
-    if rng.random() < 0.6:
-        sign = "-" if rng.random() < 0.3 else ""
-        frac = "" if rng.random() < 0.5 else "." + str(rng.randint(0, 999999)).zfill(6)
-        parts.append(f"{sign}{rng.randint(0, 50)}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}{frac}")
-    return " ".join(parts) or "0"
-
-
-def float_value():
-    r = rng.random()
-    if r < 0.12:
-        return None
-    if r < 0.25:
-        return rng.choice([0.0, -0.0, 1.0, 0.1, 1e15, 1e16, 123456789012345.6, 1e-4, 1e-5, 1.5e-7, -2.5e300,
-                           5e-324, 1.7976931348623157e308, 100.0, 1e14, 0.30000000000000004, float("nan"),
-                           float("inf"), float("-inf"), 2.0 ** 60, 1 / 3])
-    return rng.uniform(-1, 1) * 10 ** rng.randint(-9, 20)
-
+# ---------------------------------------------------------------- domain values
 
 def weight_value():
     if rng.random() < 0.15:
@@ -416,17 +269,15 @@ def order_values(oid):
         legacy_code=None if rng.random() < 0.3 else text(1)[:rng.randint(1, 16)],
         notes=blob("prose") if big and rng.random() < 0.5 else (None if rng.random() < 0.3 else text(rng.randint(1, 30))),
         manifest=blob(rng.choice(["manifest", "noise"])) if big else (None if rng.random() < 0.5 else text(rng.randint(1, 8))),
-        attrs=attrs_value(big and rng.random() < 0.5),
         rush=rng.random() < 0.3,
         stage=rng.choice(stage_labels),
     )
 
 
 order_cols = ["order_id", "customer", "status", "total", "placed_at", "ship_by", "priority", "gift", "legacy_code",
-              "notes", "manifest", "attrs"]
-item_cols = ["item_id", "order_id", "sku", "qty", "unit_price", "discount", "note", "tags", "dims", "lead_time",
-             "weight", "ratio"]
-ship_cols = ["ship_id", "order_id", "carrier", "shipped_on", "cost", "label", "payload"]
+              "notes", "manifest"]
+item_cols = ["item_id", "order_id", "sku", "qty", "unit_price", "discount", "note", "weight"]
+ship_cols = ["ship_id", "order_id", "carrier", "shipped_on", "cost", "label"]
 next_order = 1000
 next_item = 1
 next_ship = 5000
@@ -439,16 +290,16 @@ def item_values(oid):
                 sku=f"SKU-{rng.randint(1, 99999):05d}{rng.choice(['', '-XL', '-blue-ltd'])}",
                 qty=rng.randint(-5, 500), unit_price=money(0, 9999), discount=discount(),
                 note=blob("prose") if rng.random() < 0.02 else (None if rng.random() < 0.6 else text(rng.randint(1, 12))),
-                tags=text_array(), dims=int_array(), lead_time=interval_value(), weight=weight_value(),
-                ratio=float_value(), warehouse=None if rng.random() < 0.4 else rng.randint(1, 40))
+                weight=weight_value(), warehouse=None if rng.random() < 0.4 else rng.randint(1, 40))
 
 
 # partition layout as the workload sees it; refreshed from the catalog after DDL and restores
-parts = dict(legacy=False, y2025=True, y2027=False, insured=False)
+parts = dict(legacy=False, y2025=True, y2027=False, y2019=False)
 
 
 def ship_date():
-    years = [2026, 2026, 2019, 2031] + ([2025] if parts["y2025"] or rng.random() < 0.5 else []) + \
+    years = [2026, 2026, 2018, 2031] + ([2025] if parts["y2025"] or rng.random() < 0.5 else []) + \
+            ([2019] if parts["y2019"] else []) + \
             ([2027, 2027] if parts["y2027"] else []) + ([2021, 2023, 2024] if parts["legacy"] else [])
     return f"{rng.choice(years)}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"
 
@@ -460,7 +311,7 @@ def ship_values(oid):
     return dict(ship_id=next_ship, order_id=oid, carrier=rng.choice(CARRIERS), shipped_on=ship_date(),
                 cost=None if rng.random() < 0.1 else money(0, 900),
                 label=None if rng.random() < 0.3 else (blob("prose") if big and rng.random() < 0.3 else text(rng.randint(1, 4))),
-                payload=attrs_value(big), insured=rng.random() < 0.8)
+                insured=rng.random() < 0.8)
 
 
 def insert_order(c, with_items=True, upsert=False):
@@ -527,6 +378,8 @@ insert_shipments(load, rng.sample(oids, len(oids) // 2))
 legacy = [dict(ship_values(o), shipped_on=f"{rng.randint(2020, 2024)}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}")
           for o in rng.sample(oids, 25)]
 copy_rows(load, "shipments_legacy", ship_cols, legacy)
+old = [dict(ship_values(o), shipped_on=f"2019-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}") for o in rng.sample(oids, 15)]
+copy_rows(load, "archive.shipments_2019", ship_cols, old)
 load.commit()
 k = ddl.cursor()
 k.execute("ALTER TABLE orders DROP COLUMN legacy_code")
@@ -681,10 +534,7 @@ def step_once(step):
                 elif field < 0.55:
                     k.execute("UPDATE orders SET manifest = %s WHERE order_id = %s",
                               (blob(rng.choice(["manifest", "short-manifest", "noise"])), oid))
-                elif field < 0.63:
-                    k.execute("UPDATE orders SET attrs = %s WHERE order_id = %s",
-                              (attrs_value(rng.random() < 0.15), oid))
-                elif field < 0.72 and "stage" in order_cols:
+                elif field < 0.68 and "stage" in order_cols:
                     k.execute("UPDATE orders SET stage = %s WHERE order_id = %s", (rng.choice(stage_labels), oid))
                 elif field < 0.84:
                     k.execute("UPDATE orders SET priority = (coalesce(priority, 0) + 1) %% 30000 WHERE order_id = %s",
@@ -693,8 +543,8 @@ def step_once(step):
                     k.execute("UPDATE order_items SET qty = qty + %s, discount = %s WHERE order_id = %s",
                               (rng.randint(-3, 9), discount(), oid))
                 else:
-                    k.execute("UPDATE order_items SET tags = %s, lead_time = %s, ratio = %s WHERE order_id = %s",
-                              (text_array(), interval_value(), float_value(), oid))
+                    k.execute("UPDATE order_items SET weight = %s, note = %s WHERE order_id = %s",
+                              (weight_value(), text(rng.randint(1, 6)), oid))
                 held[oid] = i
         elif r < 0.43 and known:
             oid = rng.choice(known)
@@ -728,16 +578,17 @@ def step_once(step):
             sid = rng.choice(known_ship)
             if free(("s", sid), i, exclusive=True):
                 field = rng.random()
-                if field < 0.35:
-                    k.execute("UPDATE shipments SET cost = %s, label = %s WHERE ship_id = %s",
-                              (money(0, 900), text(rng.randint(1, 3)), sid))
+                if field < 0.2:
+                    k.execute("UPDATE shipments SET cost = %s WHERE ship_id = %s", (money(0, 900), sid))
+                elif field < 0.35 and "label" in ship_cols:
+                    k.execute("UPDATE shipments SET label = %s WHERE ship_id = %s",
+                              (blob("prose") if rng.random() < 0.1 else text(rng.randint(1, 3)), sid))
                 elif field < 0.65:
                     k.execute("UPDATE shipments SET shipped_on = %s WHERE ship_id = %s", (ship_date(), sid))
                 elif field < 0.8:
                     k.execute("UPDATE shipments SET carrier = %s WHERE ship_id = %s", (rng.choice(CARRIERS), sid))
                 else:
-                    k.execute("UPDATE shipments SET payload = %s WHERE ship_id = %s",
-                              (attrs_value(rng.random() < 0.2), sid))
+                    k.execute("UPDATE shipments SET order_id = order_id + 1 WHERE ship_id = %s", (sid,))
                 held[("s", sid)] = i
         elif r < 0.92 and known_ship:
             sid = rng.choice(known_ship)
@@ -767,8 +618,9 @@ def refresh_columns():
     stage_labels[:] = [r[0] for r in k.fetchall()]
     k.execute("SELECT to_regclass('shipments_2027') IS NOT NULL, "
               "EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_legacy'::regclass), "
-              "EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_2025'::regclass)")
-    parts["y2027"], parts["legacy"], parts["y2025"] = k.fetchone()
+              "EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_2025'::regclass), "
+              "EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'archive.shipments_2019'::regclass)")
+    parts["y2027"], parts["legacy"], parts["y2025"], parts["y2019"] = k.fetchone()
 
 
 def has_column(table, col):
@@ -788,15 +640,20 @@ DDL_OPS = [
     ("SELECT NOT " + has_column("orders", "gift")[7:], ["ALTER TABLE orders DROP COLUMN gift"]),
     ("SELECT EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'picked')",
      ["ALTER TYPE order_stage RENAME VALUE 'picking' TO 'picked'"]),
+    ("SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'archive.shipments_2019'::regclass)",
+     ["ALTER TABLE shipments ATTACH PARTITION archive.shipments_2019 FOR VALUES FROM ('2019-01-01') TO ('2020-01-01')"]),
     ("SELECT to_regclass('shipments_2027') IS NOT NULL",
      ["CREATE TABLE shipments_2027 PARTITION OF shipments FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')"]),
     ("SELECT format_type(atttypid, atttypmod) = 'numeric(12,3)' FROM pg_attribute "
      "WHERE attrelid = 'order_items'::regclass AND attname = 'unit_price'",
      ["ALTER TABLE order_items ALTER COLUMN unit_price TYPE numeric(12,3)"]),
+    ("SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'shipments'::regclass AND attnum = 6 "
+     "AND NOT attisdropped)", ["ALTER TABLE shipments DROP COLUMN label"]),
     ("SELECT NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_2025'::regclass)",
      ["ALTER TABLE shipments DETACH PARTITION shipments_2025"]),
     ("SELECT EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'held')",
      ["ALTER TYPE order_stage ADD VALUE 'held' BEFORE 'packed'"]),
+    (has_column("shipments", "label"), ["ALTER TABLE shipments ADD COLUMN label text DEFAULT 'relabelled'"]),
     (has_column("shipments", "insured"), ["ALTER TABLE shipments ADD COLUMN insured boolean NOT NULL DEFAULT true"]),
     (has_column("orders", "rush"), ["ALTER TABLE orders ADD COLUMN rush boolean NOT NULL DEFAULT false"]),
 ]
@@ -846,7 +703,7 @@ def run_phase(n, ddl_count, label, bad_job=False, snaps=4):
             snap.cursor().execute(f"ALTER SYSTEM SET wal_compression = '{mode}'")
             snap.cursor().execute("SELECT pg_reload_conf()")
             time.sleep(0.05)
-        if step in ckpt_at and (label in ("a", "c") or compression_cycle[-1] == "zstd"):
+        if step in ckpt_at:
             snap.cursor().execute("CHECKPOINT")
         if step in vac_at:
             snap.cursor().execute(rng.choice(["VACUUM order_items", "VACUUM orders", "VACUUM (FREEZE) order_items",
@@ -858,7 +715,7 @@ def run_phase(n, ddl_count, label, bad_job=False, snaps=4):
             k = ddl.cursor()
             k.execute("UPDATE orders SET status = 'cancelled', total = 0 WHERE order_id %% 3 = %s", (rng.randint(0, 2),))
             k.execute("DELETE FROM order_items WHERE qty < %s", (rng.randint(50, 200),))
-            k.execute("UPDATE shipments SET cost = 0, label = 'void' WHERE ship_id %% 4 = %s", (rng.randint(0, 3),))
+            k.execute("UPDATE shipments SET cost = 0 WHERE ship_id %% 4 = %s", (rng.randint(0, 3),))
             ddl.commit()
             continue
         if step in snap_at:
@@ -936,6 +793,8 @@ k.execute("""SELECT DISTINCT pg_relation_filenode(c.oid) FROM pg_class c
                 OR c.oid IN (SELECT x.oid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
                              AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%')
                              AND x.relkind = 'r')
+                OR c.oid = 'archive.shipments_2019'::regclass
+                OR c.oid = (SELECT reltoastrelid FROM pg_class WHERE oid = 'archive.shipments_2019'::regclass)
                 OR c.oid IN (SELECT x.reltoastrelid FROM pg_class x WHERE x.relnamespace = 'public'::regnamespace
                              AND (x.relname IN ('orders', 'order_items') OR x.relname LIKE 'shipments%'))""")
 ship = {str(r[0]) for r in k.fetchall() if r[0]}
@@ -970,10 +829,10 @@ restore_2 = truth[-1]["at"]
 run_phase(steps // 10, 1, "b2", bad_job=True, snaps=2)
 # timeline 2: restored to the first restore point
 restore(restore_1, "1")
-run_phase(steps // 4, 5, "c", bad_job=True)
+run_phase(steps // 4, 6, "c", bad_job=True)
 # timeline 3: restored again, this time to a point on timeline 1 after timeline 2 branched off
 restore(restore_2, "1")
-run_phase(steps - steps * 3 // 10 - steps // 5 - steps // 4, 8, "d", bad_job=True)
+run_phase(steps - steps * 3 // 10 - steps // 5 - steps // 4, 10, "d", bad_job=True)
 
 # shared locks at the end: lockers-only multixact, and a locker plus an updater
 la, lb = sessions[0], sessions[1]
