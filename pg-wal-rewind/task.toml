@@ -15,7 +15,9 @@ The crux is that the only base backup was taken at the end of the history, on ti
 - that image minus that one change is the page as it was when the archive starts, and a page the final path never changes is still the backup's copy;
 - every timeline can then be replayed forward from that common starting state.
 
-One table breaks that rule. VACUUM FULL orders runs early on timeline 1, and its old heap and TOAST files are dropped, so they are not in the backup. Old pages that no record touched before the rewrite have no image anywhere. Their rows survive only as the rewrite's copies in the new files, which the rewrite wrote as page images: xmin kept, TOAST value ids kept, but a dead xmax cleared, the command-id field reused and long values toasted differently. The agent has to pair each old file with its replacement through pg_class (same OID, new relfilenode at the rewrite's commit), subtract the copies of tuples it already knows, and treat the rest as the lost pages' contents. The staging check at the archive start falls before the rewrite, so the gap is visible.
+Two table rewrites break that rule, because the rewritten table's old heap and TOAST files are dropped and so are not in the backup. Old pages that no record touched before the rewrite have no image anywhere; their rows survive only as the rewrite's copies in the new files. The agent has to pair each old file with its replacement through pg_class (same table, new relfilenode at the rewrite's commit, and the TOAST table it points to), subtract the copies of rows it already knows, and treat the rest as the lost pages' contents. The two rewrites copy differently:
+- VACUUM FULL orders, early on timeline 1, writes its copies as page images with xmin and TOAST value ids kept, but it may clear a dead xmax, reuse the command-id field and toast a long value differently. Copies match on xmin and the key. The staging check at the archive start falls before it, so the gap is visible.
+- ALTER COLUMN TYPE on order_items runs on timeline 3 only. It inserts the visible rows again under its own xid, with unit_price converted from numeric(10,2) to numeric(12,3), and toasts values into a new TOAST table. Copies match only on the key among rows visible at the rewrite; the recovered rows predate the archive, and their unit_price has to be printed at the old column's scale. About a thousand items of closed orders are never touched before it, so on timeline 3 most of order_items' history depends on this. On timelines 1 and 2 those same pages are untouched too, so every timeline's order_items answers depend on rows recovered from a rewrite that only timeline 3 ran. There are no staging answers for order_items: the agent has to reason it out, or notice that the table's rows change across the rewrite's commit.
 
 The obvious shortcuts are wrong in ways that show up in the answers:
 - Taking the first image as-is mostly works, because the change's own transaction had not committed yet. But an abandoned timeline reuses transaction ids that timeline 3 also used, so on timeline 2 the leftover change can look committed. This fails two of the five sealed datasets.
@@ -24,7 +26,7 @@ The obvious shortcuts are wrong in ways that show up in the answers:
 
 The rest is the full reader and needs the details right: block headers (including XLOG_FPI records without main data), pglz and LZ4 page images, heap and heap2 redo, subtransactions, COMMIT PREPARED, multixacts, lock-only xmax, frozen tuples and xid wraparound (four of the five sealed datasets), a catalog read as of the instant (mapped catalogs through pg_filenode.map, enum labels renamed and extended, a domain, partitions attached and detached with columns mapped by name across a table with its own column order and one in another schema, fast defaults in attmissingval), and byte-exact text output. That includes float8 through a port of d2s.c as PostgreSQL builds it, which INCIDENT.md states with a boundary example, and interval in EncodeInterval's postgres style.
 
-The staging dataset has live answers for orders and shipments only, at two instants near the start of the archive, so the restores, the abandoned timelines and order_items have to be gotten right by reasoning. The reference is about 1,400 lines of Python. A PostgreSQL internals expert who knows the approach would need most of a working day; seeing how to recover the past from a backup taken at the end is the hard part."""
+The staging dataset has live answers for orders and shipments only, at two instants near the start of the archive, so the restores, the abandoned timelines and order_items have to be gotten right by reasoning. The reference is about 1,490 lines of Python. A PostgreSQL internals expert who knows the approach would need most of a working day; seeing how to recover the past from a backup taken at the end is the hard part."""
 solution_explanation = """Read the archive. List the timelines and read each history file to get every timeline's path, as (timeline, first LSN) pairs; a history file lists only the timeline's real ancestors. A timeline is live from its first commit record after its branch point, and timeline 1 before any of those.
 
 Find the starting state. In the first archived segment, find the first checkpoint record; its redo LSN is where replay starts, and its nextXid, nextMulti and nextMultiOffset separate transactions and multixacts that were over before the archive from later ones. Load the final backup's pages. Read the final timeline's path (the backup label's START TIMELINE) from the redo LSN. For each heap page of the database, take the first heap or heap2 record that changes it, ignoring VISIBLE records, which do not touch tuples:
@@ -33,7 +35,11 @@ Find the starting state. In the first archived segment, find the first checkpoin
 
 Pages the path never changes keep the backup's content. Pages of relations created after the checkpoint start absent.
 
-Recover the rewritten table. Replay the final path; at a commit that drops files which existed at the checkpoint (VACUUM FULL orders), read pg_class just before and just after it, and pair each dropped heap or TOAST file with the new relfilenode of the same OID. The new file's tuples that are not copies of the old file's known tuples (matched on xmin and the leading key column for the heap, on chunk id and sequence for TOAST) are the tuples of the old pages no record touched; add them to the old file as one extra page. This is the state every timeline starts from.
+Recover the rewritten tables. Replay the final path; at a commit that drops files which existed at the checkpoint (VACUUM FULL orders, ALTER COLUMN TYPE on order_items), read pg_class just before and just after it. Pair the dropped heap file with the table's new relfilenode, and its TOAST file with the new TOAST table's. The new heap's tuples that are not copies of the old file's known tuples are the tuples of the old pages no record touched:
+- if the copies carry the rewriting transaction's xid (ALTER TABLE), match them on the leading key column against the old rows visible at the commit, and give the unmatched ones a frozen xmin;
+- otherwise (VACUUM FULL), match on xmin and the leading key column.
+
+The new TOAST table's chunks that are not in the old one cover their values. A known row whose TOAST chunks were lost takes that value from its copy. Add the recovered rows to the old file as one extra page. When another timeline later writes an image of a page that had no starting state, the rows on it that predate the archive leave that extra page. Print numeric columns with a declared typmod at its scale; every stored value has it, and it undoes the conversion of the recovered rows. This is the state every timeline starts from.
 
 Replay a timeline's path from there. Skip page headers, join records that span pages, follow XLOG_SWITCH, and decode the block references; the block headers end where the declared data lengths begin. Restore page images after pglz or LZ4 decompression and hole refill. Apply heap and heap2 redo on a per-page model of line pointers and tuple bytes. A relation that is not in the backup (a partition made on an abandoned timeline) starts with its first initialised page or page image. Record commit times from commit and commit-prepared records (taking the prepared xid), including subtransactions, and keep multixact members from CREATE_ID records. Stop just before the first commit later than the instant.
 
@@ -42,7 +48,7 @@ Visibility at that point: a version counts if its xmin is frozen or committed, a
 Read pg_class (through pg_filenode.map for mapped catalogs), pg_namespace, pg_type, pg_enum, pg_inherits and pg_attribute with the same rule, as of the instant. Find the table in public and expand a partitioned table to its leaf partitions, whatever their schema. Map the parent's columns to each leaf's live attributes by name. Decode tuples through dropped columns, the null bitmap, attmissingval and TOAST, and render values in the server's text format: domains through their base type, enums through pg_enum, interval in EncodeInterval's postgres style, and float8 with a port of d2s.c's d2d() built without STRICTLY_SHORTEST."""
 verification_explanation = """Each of the five sealed datasets was produced by tests/generator/make_dataset.py with PostgreSQL 16.15. The script works as follows:
 - It builds a cluster with 1 MB segments and WAL archiving. In most seeds (four of the five sealed ones) it moves the transaction counter with pg_resetwal so that xids wrap past 2^32 during the run.
-- It loads the schema: orders, order_items and a two-level partitioned shipments table, a separately built legacy table with its own column order and a dropped column, a table in the archive schema built like shipments, an enum, a domain, and interval and float8 columns. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
+- It loads the schema: orders, order_items (with 700 to 1,100 items of closed orders that nothing touches again) and a two-level partitioned shipments table, a separately built legacy table with its own column order and a dropped column, a table in the archive schema built like shipments, an enum, a domain, and interval and float8 columns. It then rewrites orders, pg_class, pg_attribute, pg_type and pg_enum with VACUUM FULL.
 - It takes a pg_basebackup while sessions keep writing; this backup is used only for the restores and is not shipped.
 - It closes every open and prepared transaction, switches to a new WAL segment and takes a checkpoint. The archive the tool gets starts with that segment.
 - It then runs a seeded workload of three to five interleaved sessions:
@@ -54,6 +60,7 @@ verification_explanation = """Each of the five sealed datasets was produced by t
 - Its schema changes are applied in a fixed order and redone after each restore:
   - column additions and drops, including a column of the enum type with a default;
   - VACUUM FULL orders, first;
+  - ALTER COLUMN TYPE on order_items, late enough that only timeline 3 runs it;
   - attaching the legacy table, then the archive-schema table;
   - an enum value renamed, and later one added;
   - a partition created and another detached;
@@ -65,13 +72,15 @@ Throughout, the script captured the live result of SELECT * of the three tables,
 
 The test copies each dataset and the collected rewind.py into a scratch directory. It runs the tool as `python3 -I rewind.py DATA_DIR`, in one fresh process per dataset, as an unprivileged user with no new privileges and bounded CPU, memory, files and processes. It sends all of that dataset's queries on stdin and parses the JSON lines printed on stdout. The test process never imports candidate code. Columns must match exactly, and the rows must equal the live server's rows as a multiset. A further test checks that the sandboxed process can neither read the expected answers nor write the reward.
 
-Measured with 2 CPUs: the reference scores 1 and answers a dataset's 75 to 81 queries in 9 to 15 seconds. The skeleton scores 0. Each of these single mistakes injected into the reference fails at least one sealed dataset, and so scores 0:
+Measured with 2 CPUs: the reference scores 1 and answers a dataset's 78 to 81 queries in 7 to 11 seconds. The skeleton scores 0. Each of these single mistakes injected into the reference fails at least one sealed dataset, and so scores 0:
 - using the backup's pages as the starting state;
-- leaving out the rewritten table's lost pages;
-- taking the first page image without undoing its change (2 of 5 datasets);
+- leaving out the rewritten tables' lost pages;
+- matching ALTER TABLE's copies by xmin, as for VACUUM FULL;
+- printing numeric at each value's stored scale rather than the column's;
+- taking the first page image without undoing its change;
 - finding first images on timeline 1's path instead of the final timeline's;
 - trusting the backup's pg_xact for every transaction;
-- following only the relations present in the backup (2 of 5);
+- following only the relations present in the backup (4 of 5);
 - mapping a partition's columns by position;
 - keeping partitions that were detached;
 - only following partitions in the parent's schema;

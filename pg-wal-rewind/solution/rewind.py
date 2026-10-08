@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 BLCKSZ = 8192
+GHOST_BLOCK = 1 << 30  # where a rewritten table's recovered rows are kept
 EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 # rmgr ids
@@ -409,15 +410,6 @@ def dropped_rels(info, main):
     return [u32(main, p + 4 + 12 * i + 8) for i in range(u32(main, p))]
 
 
-def ghost_key(t, toast):
-    hoff = t[22]
-    if toast:  # chunk_id, chunk_seq: VACUUM FULL keeps the value ids of TOAST values
-        return bytes(t[hoff:hoff + 8])
-    # The rewrite keeps xmin, but it may clear a dead xmax, reuse the command-id field and toast a long value
-    # differently; the leading key column (orders.order_id) and xmin name a row version.
-    return bytes(t[0:4]) + bytes(t[hoff:hoff + 8])
-
-
 class Base:
     """What every timeline shares: the pages as they were at the checkpoint the archive starts with, rebuilt
     from the base backup taken at the end, plus the backup's pg_xact and pg_multixact for the transactions
@@ -506,14 +498,23 @@ class Base:
             del self.pages[key]
         for pg in self.pages.values():
             pg.lsn = 0
+        self.ghost_keylen = {}
+        self.recovered = {}   # (old TOAST filenode, value id) -> value bytes taken from a rewrite's copy
         self.add_rewrite_ghosts(data_dir, paths[final_tli], created)
 
     def add_rewrite_ghosts(self, data_dir, path, created):
-        """A VACUUM FULL in the archive drops the table's old files, which are not in the backup. Their pages
-        that no record touched before the rewrite are lost, but every tuple on them that anybody could still
-        see was copied, header and all (TOAST values keep their ids), into the new files the rewrite wrote
-        as page images. So, at the rewrite's commit, the new file's tuples that are not copies of the old
-        file's known tuples are the lost pages' tuples; they stand for those pages from the start."""
+        """A table rewrite in the archive drops the table's old heap and TOAST files, which are not in the
+        backup. Their pages that no record touched before the rewrite are lost, but every row on them that
+        was still visible got copied into the new files, which the WAL does hold:
+        - VACUUM FULL copies every version anyone could still see, keeping xmin (and TOAST value ids); it may
+          clear a dead xmax, reuse the command-id field and toast a long value differently, so a copy is
+          known by xmin and its leading key column;
+        - ALTER TABLE ... TYPE inserts the visible rows again under its own xid, with the column converted,
+          so a copy is known by its leading key column among the rows visible at the rewrite.
+        At the rewrite's commit, the copies that match no row on the old file's known pages are the lost
+        pages' rows. They are added to the old file as one extra page that holds from the start; rows
+        re-inserted by ALTER TABLE get a frozen xmin, since they predate the archive. The old and new files
+        are paired through pg_class: the same table, a new relfilenode, and the TOAST table it points to."""
         rp = Replayer(self, data_dir, path)
         for _, end, rec in rp.stream:
             xid, info, rmid, blocks, main = decode_record(rec)
@@ -523,26 +524,71 @@ class Base:
             if not gone:
                 rp.apply(end, xid, info, rmid, blocks, main)
                 continue
-            before = Snapshot(rp).classes
+            snap = Snapshot(rp)
+            before = snap.classes
+            visible = {r: [(t, rp.visible(t)) for t in rp.tuples(r)] for r in gone}
             rp.apply(end, xid, info, rmid, blocks, main)
-            after = Snapshot(rp).classes
+            later = Snapshot(rp)
+            after = later.classes
             for oid, c in before.items():
                 old = c["filenode"]
-                if old in gone and c["kind"] in "rt" and oid in after and after[oid]["filenode"] != old:
-                    toast = c["kind"] == "t"
-                    known = {}
-                    for t in rp.tuples(old):
-                        k = ghost_key(t, toast)
-                        known[k] = known.get(k, 0) + 1
-                    lost = []
-                    for t in rp.tuples(after[oid]["filenode"]):
-                        k = ghost_key(t, toast)
-                        if known.get(k):
-                            known[k] -= 1
-                        else:
-                            lost.append(bytearray(t))
-                    self.pages[(old, 1 << 30)] = Page(0, {i + 1: ("n", t) for i, t in enumerate(lost)})
-                    self.rels.add(old)
+                if c["kind"] != "r" or old not in gone or oid not in after or after[oid]["filenode"] == old:
+                    continue
+                new = after[oid]["filenode"]
+                klen = snap.atts[oid][0]["len"]
+                reinserted = any(u32(t, 0) == xid for t in rp.tuples(new))
+                if reinserted:
+                    key = lambda t: bytes(t[t[22]:t[22] + klen])
+                    known = [t for t, vis in visible[old] if vis]
+                else:
+                    key = lambda t: bytes(t[0:4]) + bytes(t[t[22]:t[22] + klen])
+                    known = [t for t, _ in visible[old]]
+                lost, pairs = self.unmatched(rp.tuples(new), known, key)
+                for t in lost if reinserted else ():
+                    m2, m = get_masks(t)
+                    set_masks(t, m2 & ~HEAP_KEYS_UPDATED, (m & ~(HEAP_XMAX_BITS | HEAP_MOVED)) | HEAP_XMIN_FROZEN
+                              | HEAP_XMAX_INVALID)
+                    set_xmax(t, 0)
+                self.add_ghosts(old, lost, klen)
+                if not (c["toast"] and after[oid]["toast"]):
+                    continue
+                old_t, new_t = before[c["toast"]]["filenode"], after[after[oid]["toast"]]["filenode"]
+                chunk = lambda t: bytes(t[t[22]:t[22] + 8])  # chunk_id, chunk_seq
+                toast_lost, _ = self.unmatched(rp.tuples(new_t), list(rp.tuples(old_t)), chunk)
+                self.add_ghosts(old_t, toast_lost, None)
+                # A known row whose TOAST chunks sat on a lost page: the rewrite toasted the value afresh
+                # (new value id, or inline), so take it from the row's copy.
+                have = {u32(t, t[22]) for t in rp.tuples(old_t)} | {u32(t, t[22]) for t in toast_lost}
+                new_chunks = later.toast(new_t)
+                old_layout = [(a["len"], a["align"]) for a in snap.atts[oid]]
+                new_layout = [(a["len"], a["align"]) for a in later.atts[oid]]
+                for o, n in pairs:
+                    ov, nv = deform(o, old_layout)[0], deform(n, new_layout)[0]
+                    for i, v in enumerate(ov):
+                        if old_layout[i][0] == -1 and v is not None and v[0] == 0x01 and u32(v, 10) not in have \
+                                and i < len(nv) and nv[i] is not None:
+                            self.recovered[(old_t, u32(v, 10))] = varlena_payload(
+                                nv[i], lambda _rel, vid: b"".join(new_chunks[vid][j] for j in range(len(new_chunks[vid]))))
+
+    @staticmethod
+    def unmatched(tuples, known, key):
+        """The tuples matching none of `known`, and (known tuple, its copy) pairs."""
+        waiting = {}
+        for t in known:
+            waiting.setdefault(key(t), []).append(t)
+        out, pairs = [], []
+        for t in tuples:
+            k = waiting.get(key(t))
+            if k:
+                pairs.append((k.pop(), t))
+            else:
+                out.append(bytearray(t))
+        return out, pairs
+
+    def add_ghosts(self, rel, tuples, klen):
+        self.pages[(rel, GHOST_BLOCK)] = Page(0, {i + 1: ("n", t) for i, t in enumerate(tuples)})
+        self.rels.add(rel)
+        self.ghost_keylen[rel] = klen
 
 
 class Replayer:
@@ -557,6 +603,8 @@ class Replayer:
         self.multis = {}      # multixact -> [(xid, status)]
         # transactions and multixacts from before the archive's checkpoint are looked up in the backup
         self.next_xid, self.next_multi, self.next_moffset = base.next_xid, base.next_multi, base.next_moffset
+        self.ghost_keylen = base.ghost_keylen
+        self.recovered = base.recovered
         self.wal = Wal(os.path.join(data_dir, "wal"), path)
         self.stream = self.wal.records(base.start)
         self.pending = None
@@ -623,6 +671,8 @@ class Replayer:
         if b.apply:
             pg = Page.parse(b.image)
             pg.lsn = lsn
+            if key not in self.pages and self.ghost_keylen.get(key[0]):
+                self.drop_ghosts(key[0], pg)
             self.pages[key] = pg
             return None
         pg = self.pages.get(key)
@@ -631,6 +681,26 @@ class Replayer:
         if lsn <= pg.lsn:
             return None
         return pg
+
+    def drop_ghosts(self, rel, pg):
+        """A timeline that never ran the rewrite writes an image of one of the lost pages: its rows from
+        before the archive are now on that page, so they stop counting among the recovered rows."""
+        klen = self.ghost_keylen[rel]
+        ghosts = self.pages[(rel, GHOST_BLOCK)].items
+        by_key = {}
+        for off, (_, t) in ghosts.items():
+            by_key.setdefault(bytes(t[t[22]:t[22] + klen]), []).append(off)
+        for item in pg.items.values():
+            if item[0] != "n":
+                continue
+            t = item[1]
+            xmin, xmax, m = u32(t, 0), u32(t, 4), u16(t, 20)
+            old = (m & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN or xid_precedes(xmin, self.next_xid)
+            gone = xmax and not m & (HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_MULTI) and \
+                xid_precedes(xmax, self.next_xid) and self.committed(xmax)
+            offs = by_key.get(bytes(t[t[22]:t[22] + klen])) if old and not gone else None
+            if offs:
+                ghosts.pop(offs.pop(), None)
 
     def init_page(self, b, lsn):
         if b.fork != 0 or b.rel[1] != self.db:
@@ -979,12 +1049,18 @@ def deform(t, atts):
     return out, natts
 
 
+class Recovered(bytes):
+    """A TOAST value already detoasted (recovered from a table rewrite's copy of the row)."""
+
+
 def varlena_payload(v, toast):
     """Datum bytes (with header) -> value bytes, detoasting and decompressing."""
     b = v[0]
     if b == 0x01:
         rawsize, extinfo, valueid, toastrel = struct.unpack_from("<iIII", v, 2)
         data = toast(toastrel, valueid)
+        if isinstance(data, Recovered):
+            return bytes(data)
         if (extinfo & 0x3FFFFFFF) < rawsize - 4:
             tcinfo = u32(data, 0)
             return decompress(extinfo >> 30, data[4:], tcinfo & 0x3FFFFFFF)
@@ -1001,7 +1077,7 @@ def decompress(method, payload, rawsize):
     return pglz_decompress(payload, rawsize) if method == 0 else lz4_decompress(payload, rawsize)
 
 
-def numeric_text(v):
+def numeric_text(v, scale=None):
     h = u16(v, 0)
     kind = h & 0xC000
     if kind == 0xC000:
@@ -1021,6 +1097,8 @@ def numeric_text(v):
     else:
         out = "".join(str(digits[i] if i < len(digits) else 0) if i == 0 else
                       "%04d" % (digits[i] if i < len(digits) else 0) for i in range(weight + 1))
+    if scale is not None:
+        dscale = scale
     if dscale > 0:
         frac = []
         i = weight + 1
@@ -1168,7 +1246,9 @@ class Types:
         self.types = types    # oid -> dict(len, align, kind, base, elem)
         self.labels = labels  # enum value oid -> label
 
-    def text(self, oid, raw):
+    def text(self, oid, raw, typmod=-1):
+        if oid == 1700 and typmod >= 4:  # numeric(p,s): every stored value has scale s
+            return numeric_text(raw, (typmod - 4) & 0xFFFF)
         t = self.types.get(oid)
         if t is not None and t["kind"] == "d":
             return self.text(t["base"], raw)
@@ -1288,6 +1368,7 @@ class Snapshot:
                 missing = self.types.array_values(varlena_payload(v[25], None))[2][0]
             self.atts.setdefault(u32(v[0], 0), []).append(
                 dict(num=num, name=v[1].rstrip(b"\0").decode(), typ=u32(v[2], 0), len=struct.unpack("<h", v[3])[0],
+                     typmod=struct.unpack("<i", v[6])[0],
                      align=chr(v[9][0]), dropped=bool(v[17][0]), missing=missing))
         for a in self.atts.values():
             a.sort(key=lambda x: x["num"])
@@ -1328,7 +1409,9 @@ class Snapshot:
             pick = [by_name[c["name"]] for c in columns]
             chunks = self.toast(self.node(rel["toast"])) if rel["toast"] else {}
 
-            def fetch(_toastrel, valueid, chunks=chunks):
+            def fetch(_toastrel, valueid, chunks=chunks, node=self.node(rel["toast"]) if rel["toast"] else None):
+                if valueid not in chunks and (node, valueid) in self.rp.recovered:
+                    return Recovered(self.rp.recovered[(node, valueid)])
                 parts = chunks[valueid]
                 return b"".join(parts[i] for i in range(len(parts)))
 
@@ -1345,9 +1428,9 @@ class Snapshot:
                     elif vals[i] is None:
                         row.append(None)
                     elif a["len"] == -1:
-                        row.append(self.types.text(a["typ"], varlena_payload(vals[i], fetch)))
+                        row.append(self.types.text(a["typ"], varlena_payload(vals[i], fetch), a["typmod"]))
                     else:
-                        row.append(self.types.text(a["typ"], vals[i]))
+                        row.append(self.types.text(a["typ"], vals[i], a["typmod"]))
                 rows.append(row)
         return {"columns": [c["name"] for c in columns], "rows": rows}
 

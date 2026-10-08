@@ -16,7 +16,8 @@ Three tables matter: `public.orders`, `public.order_items` and `public.shipments
 * Columns were added and dropped, some with defaults. One column has an enum type whose values were later renamed and extended. Another has a domain type, and there are `interval` and `float8` columns.
 * Rows were upserted, copied in with `COPY`, locked, updated, moved between partitions, and deleted.
 * Partitions were created, attached and detached. Tables that had been built separately were attached as partitions; one of them has its own column order.
-* `orders` was rewritten once with `VACUUM FULL`, early on timeline 1.
+* `orders` was rewritten once with `VACUUM FULL`, early on timeline 1, and `order_items` once with `ALTER TABLE ... ALTER COLUMN ... TYPE`, on timeline 3 only.
+* `order_items` also holds the items of long-closed orders, which nothing touched again after they were loaded.
 * Some transactions used savepoints or two-phase commit.
 * Bad jobs rewrote and deleted rows, and `VACUUM` then removed the old row versions from the heap.
 * Bad jobs were twice undone with a point-in-time restore from the older backup.

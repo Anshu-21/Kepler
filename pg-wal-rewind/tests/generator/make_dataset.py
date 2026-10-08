@@ -407,6 +407,9 @@ def insert_shipments(c, oids):
 load = connect()
 oids = [insert_order(load, with_items=rng.random() < 0.5) for _ in range(P["orders"])]
 copy_items(load, [o for o in oids if rng.random() < 0.5])
+# items of long-closed orders: nothing in the workload or the bad jobs touches them again
+cold = [dict(item_values(rng.randint(1, 900)), qty=rng.randint(200, 500)) for _ in range(rng.randint(700, 1100))]
+copy_rows(load, "order_items", item_cols, cold)
 insert_shipments(load, rng.sample(oids, len(oids) // 2))
 legacy = [dict(ship_values(o), shipped_on=f"{rng.randint(2020, 2024)}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}")
           for o in rng.sample(oids, 25)]
@@ -688,6 +691,9 @@ DDL_OPS = [
      "AND NOT attisdropped)", ["ALTER TABLE shipments DROP COLUMN label"]),
     ("SELECT NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = 'shipments_2025'::regclass)",
      ["ALTER TABLE shipments DETACH PARTITION shipments_2025"]),
+    ("SELECT format_type(atttypid, atttypmod) = 'numeric(12,3)' FROM pg_attribute "
+     "WHERE attrelid = 'order_items'::regclass AND attname = 'unit_price'",
+     ["ALTER TABLE order_items ALTER COLUMN unit_price TYPE numeric(12,3)"]),
     ("SELECT EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'held')",
      ["ALTER TYPE order_stage ADD VALUE 'held' BEFORE 'packed'"]),
     (has_column("shipments", "label"), ["ALTER TABLE shipments ADD COLUMN label text DEFAULT 'relabelled'"]),
